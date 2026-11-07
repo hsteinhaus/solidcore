@@ -503,8 +503,9 @@ fn joint_meets(
             .collect::<Result<_>>()?
     };
     for (left, right) in pairs {
-        let nl = reduced_normal(left, b)?;
-        let nr = reduced_normal(right, b)?;
+        // the limit normals: at a pole the joint's normals are the pole's, not 0
+        let nl = pole_normal(left, b)?;
+        let nr = pole_normal(right, b)?;
         // the edge: the left patch's high end, the right patch's low end, in the joint's
         // direction (a polynomial constant in it, of the edge's parameter in the other)
         let (el, er) = if along_u {
@@ -1949,6 +1950,25 @@ mod tests {
                     );
                 }
                 assert!(made.bound <= 1e-4, "d {d} tilted {tilted}: {}", made.bound);
+                let err = sampled_error(&s, &made.surface, d);
+                assert!(err <= 1e-4, "d {d} tilted {tilted}: {err}");
+            }
+        }
+    }
+
+    /// The domed quarter cut into two Bezier pieces round its axis (a knot of full
+    /// multiplicity in v, as a loft through sections stores it): the joint between them
+    /// runs into the pole, where both one-sided normals vanish. It is no crease there; the
+    /// offset is one certified surface.
+    #[test]
+    fn a_joint_running_into_a_pole_is_no_crease() {
+        use crate::nurbs::srf_basic::Direction;
+        use crate::nurbs::srf_tool::p1::insert_knot;
+        for tilted in [false, true] {
+            let s = insert_knot(&domed_quarter(tilted), 0.5, 3, Direction::V).unwrap();
+            for d in [0.2, -0.2] {
+                let made = certified_offset(&Kernel::default(), &s, d, 1e-4)
+                    .unwrap_or_else(|e| panic!("d {d} tilted {tilted}: {e:?}"));
                 let err = sampled_error(&s, &made.surface, d);
                 assert!(err <= 1e-4, "d {d} tilted {tilted}: {err}");
             }
