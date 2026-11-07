@@ -41,13 +41,29 @@
 //! 80 in the bracket). A face not certified regular is refused (D5), naming the largest
 //! wall that works: the smallest radius of curvature on the displaced side.
 //!
+//! **Poles.** Where a side of a patch collapses to one point (a dome's apex, a cone's
+//! tip), `A_u x A_v` vanishes along the whole side, and with it `Q`: `Q > 0` can never
+//! be certified there, though the surface itself may be regular. The parameterisation
+//! is singular, not the geometry. A side whose control points coincide within
+//! `zone_tol_3d` is a pole; the patch is moved rigidly into the pole's tangent frame
+//! (`Q` is invariant) and made an exact regular pole there: the side becomes one point
+//! exactly and the next line of control points (the tangent ring), when within
+//! `zone_tol_3d` of the tangent plane, lies in it exactly. Round-off would otherwise
+//! leave the ring a hair off the plane: a cone point that tiny, whose curvature, and
+//! with it the fold condition's limit, is unbounded. Then each side's power of its
+//! linear form (`1 - u`, ...) common to `Q`'s terms is divided out exactly (Bernstein
+//! degree reduction), once per patch, and the reduced form is certified on the closed
+//! patch: `Q > 0` off the side, and the reduced form's value on the side is the fold
+//! condition's limit at the pole. A degenerate parameter point has no curvature of its
+//! own and counts in no wall size.
+//!
 //! Deviations: not upstream. Bounds: at most [`MAX_ROUNDS`] refinement rounds and
 //! [`MAX_SPANS`] spans per direction for the offset; at most [`MAX_REGULARITY_PATCHES`]
 //! subdivided patches for the regularity test (a loop over an explicit stack, no
 //! recursion; the kernel's cancel token is polled per round, per row of patches and per
 //! patch examined). A face is refused when a point with `Q < 0` is found (it folds) or
-//! when the budget runs out uncertified (D5: not certified regular), which includes a
-//! base whose normal vanishes on the face (a pole), where no regular sheet is certified.
+//! when the budget runs out uncertified (D5: not certified regular). A base whose normal
+//! vanishes along a collapsed side (a pole) is certified by its limit there (above).
 
 use crate::error::{Result, SolidError};
 use crate::kernel::Kernel;
@@ -58,7 +74,8 @@ use crate::nurbs::nurbs_srf::decompose_srf;
 use crate::nurbs::srf_basic::Surface as Nurb;
 
 use super::bernstein::{
-    cross, deriv_u3, deriv_v3, dot, eval3, mul3, restrict3, sub3, Bernstein2, Bernstein3, Binomials,
+    cross, deriv_u3, deriv_v3, dot, eval3, mul3, restrict3, sub3, Bernstein2, Bernstein3,
+    Binomials, PatchSide,
 };
 
 const OP: &str = "offset::construction::sheets";
@@ -290,33 +307,57 @@ fn reduced_normal(patch: &Patch, b: &Binomials) -> Result<Bernstein3> {
     }
 }
 
-/// The point `S` and unit normal `n` (`S_u x S_v`, normalised) of the surface whose
-/// patches are `ps` at `(u, v)`.
+/// `main`'s reduced normal of a patch with each collapsed side's common factor divided
+/// out (see the module notes on poles): normal to the surface, and at a regular pole its
+/// limit instead of 0.
+///
+/// # Errors
+///
+/// Those of the Bernstein products and divisions.
+fn pole_normal(patch: &Patch, b: &Binomials) -> Result<Bernstein3> {
+    let mut n = reduced_normal(patch, b)?;
+    let x2 = dot(&n, &n, b)?;
+    for side in PatchSide::ALL {
+        let a = x2.side_order(side) / 2;
+        let m = n.iter().map(|c| c.side_order(side)).fold(a, usize::min);
+        if m > 0 {
+            let [x, y, z] = &n;
+            n = [
+                x.divide_side(side, m)?,
+                y.divide_side(side, m)?,
+                z.divide_side(side, m)?,
+            ];
+        }
+    }
+    Ok(n)
+}
+
+/// The point `S` and unit normal `n` (`S_u x S_v`, normalised; its limit at a pole) of
+/// the surface whose patches are `ps`, with their [`pole_normal`]s `normals`, at `(u, v)`.
 fn point_and_normal(
     ub: &[f64],
     vb: &[f64],
     ps: &[Vec<Patch>],
+    normals: &[Vec<Bernstein3>],
     u: f64,
     v: f64,
 ) -> Result<(Vec3, Vec3)> {
+    let (iu, iv) = (span_of(ub, u), span_of(vb, v));
     let patch = ps
-        .get(span_of(ub, u))
-        .and_then(|r| r.get(span_of(vb, v)))
+        .get(iu)
+        .and_then(|r| r.get(iv))
+        .ok_or_else(|| invalid("no patch at the parameter"))?;
+    let normal = normals
+        .get(iu)
+        .and_then(|r| r.get(iv))
         .ok_or_else(|| invalid("no patch at the parameter"))?;
     let (s, t) = local(patch.range, u, v);
     let p = eval3(&patch.p, s, t);
-    let pu = eval3(&deriv_u3(&patch.p), s, t);
-    let pv = eval3(&deriv_v3(&patch.p), s, t);
-    let (point, au, av) = match &patch.w {
-        None => (p, pu, pv),
-        Some(w) => {
-            let wv = w.eval(s, t);
-            let wu = w.deriv_u().eval(s, t);
-            let wdv = w.deriv_v().eval(s, t);
-            (p * (1.0 / wv), pu * wv - p * wu, pv * wv - p * wdv)
-        }
+    let point = match &patch.w {
+        None => p,
+        Some(w) => p * (1.0 / w.eval(s, t)),
     };
-    let n = au.cross(av);
+    let n = eval3(normal, s, t);
     let len = n.length();
     if !positive(len) {
         return Err(SolidError::Degenerate {
@@ -325,6 +366,33 @@ fn point_and_normal(
         });
     }
     Ok((point, n * (1.0 / len)))
+}
+
+/// A surface's u and v breakpoints, its Bezier patches `[iu][iv]` and their
+/// [`pole_normal`]s.
+type OffsetBase = (Vec<f64>, Vec<f64>, Vec<Vec<Patch>>, Vec<Vec<Bernstein3>>);
+
+/// The Bezier patches of `s` with their poles made one point exactly, and their
+/// [`pole_normal`]s.
+fn offset_base(k: &Kernel, s: &Nurb, b: &Binomials) -> Result<OffsetBase> {
+    let (ub, vb, ps) = patches(s)?;
+    let ps = ps
+        .iter()
+        .map(|row| {
+            row.iter()
+                .map(|p| regular_poles(p, k.tolerances.zone_tol_3d, false))
+                .collect::<Result<Vec<_>>>()
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let normals = ps
+        .iter()
+        .map(|row| {
+            row.iter()
+                .map(|p| pole_normal(p, b))
+                .collect::<Result<Vec<_>>>()
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok((ub, vb, ps, normals))
 }
 
 /// A certified offset: the B-spline and the bound on its distance from the exact
@@ -435,8 +503,9 @@ fn joint_meets(
             .collect::<Result<_>>()?
     };
     for (left, right) in pairs {
-        let nl = reduced_normal(left, b)?;
-        let nr = reduced_normal(right, b)?;
+        // the limit normals: at a pole the joint's normals are the pole's, not 0
+        let nl = pole_normal(left, b)?;
+        let nr = pole_normal(right, b)?;
         // the edge: the left patch's high end, the right patch's low end, in the joint's
         // direction (a polynomial constant in it, of the edge's parameter in the other)
         let (el, er) = if along_u {
@@ -635,6 +704,129 @@ fn interpolate(grid: &[Vec<Vec3>], gu: &[f64], gv: &[f64], ku: &[f64], kv: &[f64
     Nurb::new(net, DEGREE, DEGREE, ku.to_vec(), kv.to_vec())
 }
 
+/// The sides of the surface whose patches are `ps` (with their [`pole_normal`]s
+/// `normals`) that are poles, each with its unit normal there: a side along which every
+/// patch's control points are one point, the opposite line not.
+fn pole_sides(ps: &[Vec<Patch>], normals: &[Vec<Bernstein3>]) -> Vec<(PatchSide, Vec3)> {
+    let point = |patch: &Patch, i: usize| {
+        let at = |k: &Bernstein2| k.coefficients().get(i).copied().unwrap_or(0.0);
+        let w = patch.w.as_ref().map_or(1.0, at);
+        let [x, y, z] = &patch.p;
+        Vec3::new(at(x), at(y), at(z)) * (1.0 / w)
+    };
+    // the control point indices of a side of a patch
+    let line = |patch: &Patch, side: PatchSide| -> Vec<usize> {
+        let [x, _, _] = &patch.p;
+        let (du, dv) = x.degrees();
+        let width = dv + 1;
+        match side {
+            PatchSide::U0 => (0..width).collect(),
+            PatchSide::U1 => (0..width).map(|j| du * width + j).collect(),
+            PatchSide::V0 => (0..=du).map(|i| i * width).collect(),
+            PatchSide::V1 => (0..=du).map(|i| i * width + dv).collect(),
+        }
+    };
+    let one_point = |patch: &Patch, side: PatchSide| {
+        let pts: Vec<Vec3> = line(patch, side)
+            .into_iter()
+            .map(|i| point(patch, i))
+            .collect();
+        pts.windows(2)
+            .all(|w| matches!(w, [a, b] if (*a - *b).length() == 0.0))
+    };
+    let opposite = |side: PatchSide| match side {
+        PatchSide::U0 => PatchSide::U1,
+        PatchSide::U1 => PatchSide::U0,
+        PatchSide::V0 => PatchSide::V1,
+        PatchSide::V1 => PatchSide::V0,
+    };
+    let rows = ps.len();
+    let cols = ps.first().map_or(0, Vec::len);
+    let mut out = Vec::new();
+    for side in PatchSide::ALL {
+        let along: Vec<(usize, usize)> = match side {
+            PatchSide::U0 => (0..cols).map(|j| (0, j)).collect(),
+            PatchSide::U1 => (0..cols).map(|j| (rows.saturating_sub(1), j)).collect(),
+            PatchSide::V0 => (0..rows).map(|i| (i, 0)).collect(),
+            PatchSide::V1 => (0..rows).map(|i| (i, cols.saturating_sub(1))).collect(),
+        };
+        let patch_at = |(i, j): (usize, usize)| ps.get(i).and_then(|r| r.get(j));
+        let pole = !along.is_empty()
+            && along.iter().all(|&ij| {
+                patch_at(ij).is_some_and(|p| one_point(p, side) && !one_point(p, opposite(side)))
+            });
+        if !pole {
+            continue;
+        }
+        let (s, t) = match side {
+            PatchSide::U0 => (0.0, 0.5),
+            PatchSide::U1 => (1.0, 0.5),
+            PatchSide::V0 => (0.5, 0.0),
+            PatchSide::V1 => (0.5, 1.0),
+        };
+        let n = along
+            .first()
+            .and_then(|&(i, j)| normals.get(i).and_then(|r| r.get(j)))
+            .map(|f| eval3(f, s, t));
+        if let Some(n) = n.filter(|n| positive(n.length())) {
+            out.push((side, n * (1.0 / n.length())));
+        }
+    }
+    out
+}
+
+/// `g` with each pole of its base (`poles`, as [`pole_sides`]) made exact in it too: the
+/// pole's line of control points one point, and the next line (its tangent ring) in the
+/// plane through that point normal to the pole's normal. So every face meeting at the
+/// offset's pole has the one tangent plane there (the offset's apex is G1, not a cone of
+/// fitted rings); `g` moves by less than its own fit, and is certified after this.
+fn flatten_pole_rings(g: Nurb, poles: &[(PatchSide, Vec3)]) -> Result<Nurb> {
+    let mut net = g.cpts();
+    let rows = net.len();
+    let cols = net.first().map_or(0, Vec::len);
+    if poles.is_empty() || rows < 2 || cols < 2 {
+        return Ok(g);
+    }
+    let e = |c: &CPoint| Vec3::new(c.x, c.y, c.z);
+    for &(side, n) in poles {
+        // the k-th line of control points in from the side
+        let line_at = |k: usize| -> Vec<(usize, usize)> {
+            match side {
+                PatchSide::U0 => (0..cols).map(|j| (k, j)).collect(),
+                PatchSide::U1 => (0..cols).map(|j| (rows - 1 - k, j)).collect(),
+                PatchSide::V0 => (0..rows).map(|i| (i, k)).collect(),
+                PatchSide::V1 => (0..rows).map(|i| (i, cols - 1 - k)).collect(),
+            }
+        };
+        let (line, ring) = (line_at(0), line_at(1));
+        let at =
+            |net: &[Vec<CPoint>], (i, j): (usize, usize)| net.get(i).and_then(|r| r.get(j)).map(e);
+        let pts: Vec<Vec3> = line.iter().filter_map(|&ij| at(&net, ij)).collect();
+        let o = pts.iter().fold(Vec3::new(0.0, 0.0, 0.0), |a, p| a + *p)
+            * (1.0 / pts.len().max(1) as f64);
+        let set = |net: &mut Vec<Vec<CPoint>>, (i, j): (usize, usize), p: Vec3| {
+            if let Some(c) = net.get_mut(i).and_then(|r| r.get_mut(j)) {
+                *c = CPoint::new(p.x, p.y, p.z, NOW);
+            }
+        };
+        for &ij in &line {
+            set(&mut net, ij, o);
+        }
+        for &ij in &ring {
+            if let Some(p) = at(&net, ij) {
+                set(&mut net, ij, p - n * (p - o).dot(n));
+            }
+        }
+    }
+    Nurb::new(
+        net,
+        DEGREE,
+        DEGREE,
+        g.u_knots().to_vec(),
+        g.v_knots().to_vec(),
+    )
+}
+
 /// The polynomials whose coefficients bound the error of `G` on one patch.
 struct ErrorForms {
     /// `D'.D' - d^2 w^2`.
@@ -650,8 +842,16 @@ struct ErrorForms {
 }
 
 impl ErrorForms {
-    fn new(s: &Patch, g: &Bernstein3, d: f64, b: &Binomials) -> Result<Self> {
-        let (au, av) = homogeneous_tangents(s, b)?;
+    /// The forms of `s` (whose homogeneous tangents, in its parameters up to a positive
+    /// scale each, are `tangents`) against `g`.
+    fn new(
+        s: &Patch,
+        g: &Bernstein3,
+        tangents: (Bernstein3, Bernstein3),
+        d: f64,
+        b: &Binomials,
+    ) -> Result<Self> {
+        let (au, av) = tangents;
         let dn = match &s.w {
             None => sub3(g, &s.p, b)?,
             Some(w) => sub3(&mul3(g, w, b)?, &s.p, b)?,
@@ -675,6 +875,28 @@ impl ErrorForms {
             side: dot(&dn, &ax, b)?.scale(d.signum()),
             w: s.w.clone(),
         })
+    }
+
+    /// The forms with each collapsed side's common factor divided out (see the module
+    /// notes on poles): `T` and `|A_u x A_v|^2` by the same power, the side test by its
+    /// own (only its sign counts).
+    ///
+    /// # Errors
+    ///
+    /// Those of the Bernstein divisions.
+    fn reduced(mut self) -> Result<Self> {
+        for side in PatchSide::ALL {
+            let m = self.x2.side_order(side).min(self.t.side_order(side));
+            if m > 0 {
+                self.x2 = self.x2.divide_side(side, m)?;
+                self.t = self.t.divide_side(side, m)?;
+            }
+            let k = self.side.side_order(side);
+            if k > 0 {
+                self.side = self.side.divide_side(side, k)?;
+            }
+        }
+        Ok(self)
     }
 
     /// The certified bound on this patch (infinite where a denominator or the side is
@@ -776,7 +998,8 @@ pub fn certified_offset(k: &Kernel, s: &Nurb, d: f64, tol: f64) -> Result<Certif
     let (p, q) = s.degrees();
     let (sub, sub_mults) = breakpoints(s.u_knots(), p)?;
     let (svb, svb_mults) = breakpoints(s.v_knots(), q)?;
-    let (ub, vb, ps) = patches(s)?;
+    let (ub, vb, ps, normals) = offset_base(k, s, &b)?;
+    let poles = pole_sides(&ps, &normals);
     // the joints at multiplicity p (q) proved tangent continuous (an exact extension's)
     let smooth = |mults: &[usize], deg: usize, along_u: bool| -> Result<Vec<bool>> {
         mults
@@ -805,12 +1028,12 @@ pub fn certified_offset(k: &Kernel, s: &Nurb, d: f64, tol: f64) -> Result<Certif
         for &u in &gu {
             let mut row = Vec::new();
             for &v in &gv {
-                let (point, n) = point_and_normal(&ub, &vb, &ps, u, v)?;
+                let (point, n) = point_and_normal(&ub, &vb, &ps, &normals, u, v)?;
                 row.push(point + n * d);
             }
             grid.push(row);
         }
-        let g = interpolate(&grid, &gu, &gv, &ku, &kv)?;
+        let g = flatten_pole_rings(interpolate(&grid, &gu, &gv, &ku, &kv)?, &poles)?;
         let (gub, _) = breakpoints(&ku, DEGREE)?;
         let (gvb, _) = breakpoints(&kv, DEGREE)?;
         let gp = offset_patches(&g)?;
@@ -839,7 +1062,13 @@ pub fn certified_offset(k: &Kernel, s: &Nurb, d: f64, tol: f64) -> Result<Certif
                     p: restrict3(&spatch.p, s0, s1, t0, t1),
                     w: spatch.w.as_ref().map(|w| w.restrict(s0, s1, t0, t1)),
                 };
-                let forms = ErrorForms::new(&restricted, gpatch, d, &b)?;
+                // the tangents of the base patch, restricted: exact zeros along a pole kept
+                let (au, av) = homogeneous_tangents(spatch, &b)?;
+                let tangents = (
+                    restrict3(&au, s0, s1, t0, t1),
+                    restrict3(&av, s0, s1, t0, t1),
+                );
+                let forms = ErrorForms::new(&restricted, gpatch, tangents, d, &b)?.reduced()?;
                 let mut bound = forms.bound(d);
                 if bound > tol {
                     let (quarters, by_u, by_v) = forms.split_bounds(d);
@@ -947,6 +1176,40 @@ impl RegularityForms {
         self.q0.min_coefficient() - worst > 0.0
     }
 
+    /// The forms with each collapsed side's common factor divided out (see the module
+    /// notes on poles): on a side `l` where `X^2` vanishes to order `2a`, `q0` to order
+    /// `o0` and `q1` to order `o1`, `Q = l^m (q0' - X' l^k q1')` with
+    /// `m = min(o0, a + o1)`, `k = a + o1 - m`. The result has the same sign as `Q` off
+    /// the side and is `Q`'s limit there; the forms themselves on a patch with no such side.
+    ///
+    /// # Errors
+    ///
+    /// Those of the Bernstein products and divisions.
+    fn reduced(&self, b: &Binomials) -> Result<Self> {
+        let (mut q0, mut q1, mut x2) = (self.q0.clone(), self.q1.clone(), self.x2.clone());
+        for side in PatchSide::ALL {
+            let a = x2.side_order(side) / 2;
+            if a == 0 {
+                continue;
+            }
+            let (o0, o1) = (q0.side_order(side), q1.side_order(side));
+            let m = o0.min(a + o1);
+            q0 = q0.divide_side(side, m)?;
+            q1 = q1.divide_side(side, o1)?;
+            x2 = x2.divide_side(side, 2 * a)?;
+            let l = match side {
+                PatchSide::U0 => Bernstein2::new(1, 0, vec![0.0, 1.0])?,
+                PatchSide::U1 => Bernstein2::new(1, 0, vec![1.0, 0.0])?,
+                PatchSide::V0 => Bernstein2::new(0, 1, vec![0.0, 1.0])?,
+                PatchSide::V1 => Bernstein2::new(0, 1, vec![1.0, 0.0])?,
+            };
+            for _ in 0..(a + o1 - m) {
+                q1 = q1.mul(&l, b)?;
+            }
+        }
+        Ok(Self { q0, q1, x2 })
+    }
+
     /// `Q` at the middle of the patch.
     fn middle(&self) -> f64 {
         let x = self.x2.eval(0.5, 0.5).max(0.0).sqrt();
@@ -1019,10 +1282,14 @@ pub fn certify_regular(
     uv_box: Option<[f64; 4]>,
 ) -> Result<Regularity> {
     let b = Binomials::new();
-    let region = patches_in(s, uv_box)?;
+    // each patch with its poles made exact, for the forms and the wall sizes alike
+    let region = patches_in(s, uv_box)?
+        .iter()
+        .map(|patch| regular_poles(patch, k.tolerances.zone_tol_3d, true))
+        .collect::<Result<Vec<_>>>()?;
     let mut stack: Vec<RegularityForms> = Vec::new();
     for patch in &region {
-        stack.push(RegularityForms::new(patch, d, &b)?);
+        stack.push(RegularityForms::new(patch, d, &b)?.reduced(&b)?);
     }
     let mut examined = 0usize;
     let mut folds = false;
@@ -1098,6 +1365,122 @@ pub fn proved_singular(
         radius,
         collapses: radius - reach >= -resolution,
     }))
+}
+
+/// `patch` with its poles made exact (see the module notes on poles): a side whose
+/// control points coincide within `tol`, while the opposite side's do not (both short
+/// is a sliver, no pole), becomes one point exactly (their mean). With
+/// `frame`, the patch is first moved rigidly into the tangent frame of its first pole
+/// (the pole at the origin), and each pole's next line of control points (the tangent
+/// ring), when it lies within `tol` of the plane through the pole parallel to that
+/// frame's, gets the pole's normal coordinate exactly. `Q` is invariant under the move;
+/// the snaps stay within `tol`. Weights stay as they are.
+fn regular_poles(patch: &Patch, tol: f64, frame: bool) -> Result<Patch> {
+    let [px, py, pz] = &patch.p;
+    let (du, dv) = px.degrees();
+    let width = dv + 1;
+    let count = (du + 1) * width;
+    let weight = |i: usize| {
+        patch
+            .w
+            .as_ref()
+            .and_then(|w| w.coefficients().get(i).copied())
+            .unwrap_or(1.0)
+    };
+    let coord = |c: &Bernstein2, i: usize| c.coefficients().get(i).copied().unwrap_or(0.0);
+    let mut e: Vec<Vec3> = (0..count)
+        .map(|i| Vec3::new(coord(px, i), coord(py, i), coord(pz, i)) * (1.0 / weight(i)))
+        .collect();
+    let row = |r: usize| (0..width).map(|j| r * width + j).collect::<Vec<_>>();
+    let column = |c: usize| (0..=du).map(|i| i * width + c).collect::<Vec<_>>();
+    // (side, its tangent ring, the opposite side)
+    let mut sides = Vec::new();
+    if du > 0 {
+        sides.push((row(0), row(1), row(du)));
+        sides.push((row(du), row(du - 1), row(0)));
+    }
+    if dv > 0 {
+        sides.push((column(0), column(1), column(dv)));
+        sides.push((column(dv), column(dv - 1), column(0)));
+    }
+    let at = |e: &[Vec3], i: usize| e.get(i).copied().unwrap_or(Vec3::new(0.0, 0.0, 0.0));
+    let mut framed = false;
+    // a line of control points within `tol` of its mean
+    let collapsed = |e: &[Vec3], line: &[usize]| {
+        let n = line.len().max(1) as f64;
+        let mean = line
+            .iter()
+            .fold(Vec3::new(0.0, 0.0, 0.0), |a, &i| a + at(e, i))
+            * (1.0 / n);
+        line.len() >= 2 && line.iter().all(|&i| (at(e, i) - mean).length() <= tol)
+    };
+    for (side, ring, opposite) in &sides {
+        // a pole: this side one point, the opposite one not (both short: a sliver)
+        if !collapsed(&e, side) || collapsed(&e, opposite) {
+            continue;
+        }
+        let n = side.len().max(1) as f64;
+        let pole = side
+            .iter()
+            .fold(Vec3::new(0.0, 0.0, 0.0), |a, &i| a + at(&e, i))
+            * (1.0 / n);
+        if frame && !framed {
+            // the tangent plane: the ring's spokes from the pole, summed pairwise
+            let mut normal = Vec3::new(0.0, 0.0, 0.0);
+            for pair in ring.windows(2) {
+                if let [a, c] = pair {
+                    normal += (at(&e, *a) - pole).cross(at(&e, *c) - pole);
+                }
+            }
+            let len = normal.length();
+            if positive(len) {
+                let z = normal * (1.0 / len);
+                let seed = if z.x.abs() < 0.9 {
+                    Vec3::new(1.0, 0.0, 0.0)
+                } else {
+                    Vec3::new(0.0, 1.0, 0.0)
+                };
+                let x = seed - z * seed.dot(z);
+                let x = x * (1.0 / x.length());
+                let y = z.cross(x);
+                for q in &mut e {
+                    let r = *q - pole;
+                    *q = Vec3::new(r.dot(x), r.dot(y), r.dot(z));
+                }
+                framed = true;
+            }
+        }
+        let pole = side
+            .iter()
+            .fold(Vec3::new(0.0, 0.0, 0.0), |a, &i| a + at(&e, i))
+            * (1.0 / n);
+        for &i in side {
+            if let Some(q) = e.get_mut(i) {
+                *q = pole;
+            }
+        }
+        if framed && ring.iter().all(|&i| (at(&e, i).z - pole.z).abs() <= tol) {
+            for &i in ring {
+                if let Some(q) = e.get_mut(i) {
+                    q.z = pole.z;
+                }
+            }
+        }
+    }
+    let homogeneous = |f: fn(&Vec3) -> f64| {
+        (0..count)
+            .map(|i| f(&at(&e, i)) * weight(i))
+            .collect::<Vec<_>>()
+    };
+    Ok(Patch {
+        range: patch.range,
+        p: [
+            Bernstein2::new(du, dv, homogeneous(|q| q.x))?,
+            Bernstein2::new(du, dv, homogeneous(|q| q.y))?,
+            Bernstein2::new(du, dv, homogeneous(|q| q.z))?,
+        ],
+        w: patch.w.clone(),
+    })
 }
 
 /// The principal curvatures (signed along the NURB normal) of a patch at `(s, t)`.
@@ -1252,7 +1635,7 @@ mod tests {
 
     /// `|G - (S + d n)|` at a fresh grid of parameters, its largest value.
     fn sampled_error(s: &Nurb, g: &Nurb, d: f64) -> f64 {
-        let (ub, vb, ps) = patches(s).unwrap();
+        let (ub, vb, ps, normals) = offset_base(&Kernel::default(), s, &Binomials::new()).unwrap();
         let (gub, gvb, gp) = patches(g).unwrap();
         let mut worst: f64 = 0.0;
         for i in 0..=100 {
@@ -1260,7 +1643,7 @@ mod tests {
                 // irrational-ish steps, away from the interpolation nodes
                 let u = (f64::from(i) * 0.618_034 / 100.0 + 0.001).fract();
                 let v = (f64::from(j) * 0.414_214 / 100.0 + 0.002).fract();
-                let (p, n) = point_and_normal(&ub, &vb, &ps, u, v).unwrap();
+                let (p, n) = point_and_normal(&ub, &vb, &ps, &normals, u, v).unwrap();
                 let patch = &gp[span_of(&gub, u)][span_of(&gvb, v)];
                 let (a, b) = local(patch.range, u, v);
                 let gpt = eval3(&patch.p, a, b);
@@ -1438,6 +1821,139 @@ mod tests {
                 panic!("t11 towards the centre folds");
             };
             assert!((largest - 10.0).abs() < 1e-9, "{largest}");
+        }
+    }
+
+    /// A bicubic quarter of a hemisphere of radius 50 (u from the base up to the apex, v
+    /// round a quarter), its apex row of control points one point: a pole. Its control
+    /// points come from cosines and sines, so the apex row and its tangent ring are one
+    /// point and flat only to round-off, as in a modelled dome; `tilted` turns it about a
+    /// skew axis, so that its tangent plane at the pole is no coordinate plane.
+    fn domed_quarter(tilted: bool) -> Nurb {
+        let (r, k) = (50.0, 0.552_284_749_830_793_4);
+        let arc = |a1: f64| {
+            let (c1, s1) = (a1.cos(), a1.sin());
+            [(1.0, 0.0), (1.0, k), (c1 + k * s1, s1 - k * c1), (c1, s1)]
+        };
+        let quarter = arc(core::f64::consts::FRAC_PI_2);
+        let turn = |q: Vec3| {
+            if !tilted {
+                return q;
+            }
+            // Rodrigues: 0.7 rad about (1, 2, 3)
+            let axis = Vec3::new(1.0, 2.0, 3.0) * (1.0 / 14f64.sqrt());
+            let (c, s) = (0.7f64.cos(), 0.7f64.sin());
+            q * c + axis.cross(q) * s + axis * (axis.dot(q) * (1.0 - c))
+        };
+        let net = quarter
+            .iter()
+            .map(|&(rad, z)| {
+                quarter
+                    .iter()
+                    .map(|&(cx, cy)| {
+                        let q = turn(Vec3::new(r * rad * cx, r * rad * cy, r * z));
+                        CPoint::new(q.x, q.y, q.z, NOW)
+                    })
+                    .collect()
+            })
+            .collect();
+        let knots = vec![0., 0., 0., 0., 1., 1., 1., 1.];
+        Nurb::new(net, 3, 3, knots.clone(), knots).unwrap()
+    }
+
+    /// The pole at the apex is regular: a thin wall either way certifies, and a wall past
+    /// the radius folds on one side only, naming the radius (not 0 from the pole).
+    #[test]
+    fn domed_quarter_with_a_pole_certifies() {
+        for tilted in [false, true] {
+            let s = domed_quarter(tilted);
+            for d in [1.0, -1.0] {
+                assert_eq!(
+                    certify_regular(&Kernel::default(), &s, d, None).unwrap(),
+                    Regularity::Regular,
+                    "d {d} tilted {tilted}"
+                );
+            }
+            let folds: Vec<f64> = [60.0, -60.0]
+                .iter()
+                .filter_map(
+                    |&d| match certify_regular(&Kernel::default(), &s, d, None).unwrap() {
+                        Regularity::Folds { largest } => Some(largest),
+                        Regularity::Regular => None,
+                    },
+                )
+                .collect();
+            assert_eq!(folds.len(), 1, "{folds:?} tilted {tilted}");
+            assert!(
+                folds.iter().all(|w| (45.0..55.0).contains(w)),
+                "{folds:?} tilted {tilted}"
+            );
+        }
+    }
+
+    /// The offset through the pole is certified (its normal there is the limit), and
+    /// agrees with the exact offset at fresh points, the pole included.
+    #[test]
+    fn domed_quarter_offset_is_certified_through_its_pole() {
+        for tilted in [false, true] {
+            let s = domed_quarter(tilted);
+            for d in [0.2, -0.2, 5.0] {
+                let made = certified_offset(&Kernel::default(), &s, d, 1e-4)
+                    .unwrap_or_else(|e| panic!("d {d} tilted {tilted}: {e:?}"));
+                // the offset's tangent ring at the pole lies in the apex's tangent plane
+                let (base, g) = (s.cpts(), made.surface.cpts());
+                let e = |c: &CPoint| Vec3::new(c.x, c.y, c.z);
+                let (apex, ring) = (e(&base[3][0]), &base[2]);
+                let spokes = (e(&ring[0]) - apex).cross(e(&ring[3]) - apex);
+                let n = spokes * (1.0 / spokes.length());
+                let (top, below) = (&g[g.len() - 1], &g[g.len() - 2]);
+                for c in below {
+                    let off = (e(c) - e(&top[0])).dot(n).abs();
+                    assert!(
+                        off < 1e-9,
+                        "d {d} tilted {tilted}: ring {off} off the plane"
+                    );
+                }
+                assert!(made.bound <= 1e-4, "d {d} tilted {tilted}: {}", made.bound);
+                let err = sampled_error(&s, &made.surface, d);
+                assert!(err <= 1e-4, "d {d} tilted {tilted}: {err}");
+            }
+        }
+    }
+
+    /// A sliver span (the parabola with a knot 1e-7 from its end, as a trimmed extension
+    /// leaves one) is no pole: its short sides are not snapped, and it offsets as one
+    /// certified surface.
+    #[test]
+    fn a_sliver_span_is_no_pole() {
+        let t = 1e-7;
+        let lerp =
+            |a: (f64, f64), b: (f64, f64), t: f64| (a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t);
+        let (p0, p1, p2) = ((-10.0, 0.0), (0.0, 10.0), (10.0, 0.0));
+        let (a, c) = (lerp(p0, p1, t), lerp(p1, p2, t));
+        let pts = [p0, a, lerp(a, c, t), c, p2];
+        let net = pts
+            .iter()
+            .map(|&(x, y)| vec![CPoint::new(x, y, 0.0, NOW), CPoint::new(x, y, 20.0, NOW)])
+            .collect();
+        let s = Nurb::new(
+            net,
+            2,
+            1,
+            vec![0., 0., 0., t, t, 1., 1., 1.],
+            vec![0., 0., 1., 1.],
+        )
+        .unwrap();
+        for d in [1.0, -1.0] {
+            let made = certified_offset(&Kernel::default(), &s, d, 1e-4)
+                .unwrap_or_else(|e| panic!("d {d}: {e:?}"));
+            let err = sampled_error(&s, &made.surface, d);
+            assert!(err <= 1e-4, "d {d}: {err}");
+            assert_eq!(
+                certify_regular(&Kernel::default(), &s, d, None).unwrap(),
+                Regularity::Regular,
+                "d {d}"
+            );
         }
     }
 
