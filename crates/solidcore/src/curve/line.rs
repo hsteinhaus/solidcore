@@ -1876,6 +1876,28 @@ impl Line {
         Ok(())
     }
 
+    /// The mirror image of the line about the XY plane of `mirror_plane`: a line with
+    /// its point and direction mirrored and its domain, scale and parameterisation kept,
+    /// its NURB (when made) mirrored with it. Upstream mirrors a line as its NURB
+    /// (`SmBSplineCurve::CreateMirrorCurve`): a B-spline over the whole analytic domain,
+    /// whose control points lie `SM_INFINITE_PARAMETER` lengths out, so every point of
+    /// it is good to some `1e-8` only and a crossing found on it is filtered out as not
+    /// exact.
+    ///
+    /// # Errors
+    ///
+    /// Those of [`BSplineCurve::create_mirror_curve`] for the NURB.
+    pub fn create_mirror_curve(&self, mirror_plane: &Axis2Placement) -> Result<Self> {
+        let mut mirrored = self.copy();
+        mirrored.point = mirror_plane.mirror_point(self.point);
+        mirrored.vector = mirror_plane.mirror_vector(self.vector);
+        if self.base.nurb.is_some() {
+            mirrored.base = self.base.create_mirror_curve(mirror_plane)?;
+            mirrored.base.form = self.base.form;
+        }
+        Ok(mirrored)
+    }
+
     /// Moves the line ends to `tgt_start` / `tgt_end` (`DeformToEndPointTargets`). With
     /// both tangent types [`InValueType::Unconstrained`] the line itself becomes the
     /// segment between the targets (domain `[0, 1]`) and `None` is returned;
