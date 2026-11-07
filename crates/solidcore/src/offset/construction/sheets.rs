@@ -703,6 +703,129 @@ fn interpolate(grid: &[Vec<Vec3>], gu: &[f64], gv: &[f64], ku: &[f64], kv: &[f64
     Nurb::new(net, DEGREE, DEGREE, ku.to_vec(), kv.to_vec())
 }
 
+/// The sides of the surface whose patches are `ps` (with their [`pole_normal`]s
+/// `normals`) that are poles, each with its unit normal there: a side along which every
+/// patch's control points are one point, the opposite line not.
+fn pole_sides(ps: &[Vec<Patch>], normals: &[Vec<Bernstein3>]) -> Vec<(PatchSide, Vec3)> {
+    let point = |patch: &Patch, i: usize| {
+        let at = |k: &Bernstein2| k.coefficients().get(i).copied().unwrap_or(0.0);
+        let w = patch.w.as_ref().map_or(1.0, at);
+        let [x, y, z] = &patch.p;
+        Vec3::new(at(x), at(y), at(z)) * (1.0 / w)
+    };
+    // the control point indices of a side of a patch
+    let line = |patch: &Patch, side: PatchSide| -> Vec<usize> {
+        let [x, _, _] = &patch.p;
+        let (du, dv) = x.degrees();
+        let width = dv + 1;
+        match side {
+            PatchSide::U0 => (0..width).collect(),
+            PatchSide::U1 => (0..width).map(|j| du * width + j).collect(),
+            PatchSide::V0 => (0..=du).map(|i| i * width).collect(),
+            PatchSide::V1 => (0..=du).map(|i| i * width + dv).collect(),
+        }
+    };
+    let one_point = |patch: &Patch, side: PatchSide| {
+        let pts: Vec<Vec3> = line(patch, side)
+            .into_iter()
+            .map(|i| point(patch, i))
+            .collect();
+        pts.windows(2)
+            .all(|w| matches!(w, [a, b] if (*a - *b).length() == 0.0))
+    };
+    let opposite = |side: PatchSide| match side {
+        PatchSide::U0 => PatchSide::U1,
+        PatchSide::U1 => PatchSide::U0,
+        PatchSide::V0 => PatchSide::V1,
+        PatchSide::V1 => PatchSide::V0,
+    };
+    let rows = ps.len();
+    let cols = ps.first().map_or(0, Vec::len);
+    let mut out = Vec::new();
+    for side in PatchSide::ALL {
+        let along: Vec<(usize, usize)> = match side {
+            PatchSide::U0 => (0..cols).map(|j| (0, j)).collect(),
+            PatchSide::U1 => (0..cols).map(|j| (rows.saturating_sub(1), j)).collect(),
+            PatchSide::V0 => (0..rows).map(|i| (i, 0)).collect(),
+            PatchSide::V1 => (0..rows).map(|i| (i, cols.saturating_sub(1))).collect(),
+        };
+        let patch_at = |(i, j): (usize, usize)| ps.get(i).and_then(|r| r.get(j));
+        let pole = !along.is_empty()
+            && along.iter().all(|&ij| {
+                patch_at(ij).is_some_and(|p| one_point(p, side) && !one_point(p, opposite(side)))
+            });
+        if !pole {
+            continue;
+        }
+        let (s, t) = match side {
+            PatchSide::U0 => (0.0, 0.5),
+            PatchSide::U1 => (1.0, 0.5),
+            PatchSide::V0 => (0.5, 0.0),
+            PatchSide::V1 => (0.5, 1.0),
+        };
+        let n = along
+            .first()
+            .and_then(|&(i, j)| normals.get(i).and_then(|r| r.get(j)))
+            .map(|f| eval3(f, s, t));
+        if let Some(n) = n.filter(|n| positive(n.length())) {
+            out.push((side, n * (1.0 / n.length())));
+        }
+    }
+    out
+}
+
+/// `g` with each pole of its base (`poles`, as [`pole_sides`]) made exact in it too: the
+/// pole's line of control points one point, and the next line (its tangent ring) in the
+/// plane through that point normal to the pole's normal. So every face meeting at the
+/// offset's pole has the one tangent plane there (the offset's apex is G1, not a cone of
+/// fitted rings); `g` moves by less than its own fit, and is certified after this.
+fn flatten_pole_rings(g: Nurb, poles: &[(PatchSide, Vec3)]) -> Result<Nurb> {
+    let mut net = g.cpts();
+    let rows = net.len();
+    let cols = net.first().map_or(0, Vec::len);
+    if poles.is_empty() || rows < 2 || cols < 2 {
+        return Ok(g);
+    }
+    let e = |c: &CPoint| Vec3::new(c.x, c.y, c.z);
+    for &(side, n) in poles {
+        // the k-th line of control points in from the side
+        let line_at = |k: usize| -> Vec<(usize, usize)> {
+            match side {
+                PatchSide::U0 => (0..cols).map(|j| (k, j)).collect(),
+                PatchSide::U1 => (0..cols).map(|j| (rows - 1 - k, j)).collect(),
+                PatchSide::V0 => (0..rows).map(|i| (i, k)).collect(),
+                PatchSide::V1 => (0..rows).map(|i| (i, cols - 1 - k)).collect(),
+            }
+        };
+        let (line, ring) = (line_at(0), line_at(1));
+        let at =
+            |net: &[Vec<CPoint>], (i, j): (usize, usize)| net.get(i).and_then(|r| r.get(j)).map(e);
+        let pts: Vec<Vec3> = line.iter().filter_map(|&ij| at(&net, ij)).collect();
+        let o = pts.iter().fold(Vec3::new(0.0, 0.0, 0.0), |a, p| a + *p)
+            * (1.0 / pts.len().max(1) as f64);
+        let set = |net: &mut Vec<Vec<CPoint>>, (i, j): (usize, usize), p: Vec3| {
+            if let Some(c) = net.get_mut(i).and_then(|r| r.get_mut(j)) {
+                *c = CPoint::new(p.x, p.y, p.z, NOW);
+            }
+        };
+        for &ij in &line {
+            set(&mut net, ij, o);
+        }
+        for &ij in &ring {
+            if let Some(p) = at(&net, ij) {
+                set(&mut net, ij, p - n * (p - o).dot(n));
+            }
+        }
+    }
+    Nurb::new(
+        net,
+        DEGREE,
+        DEGREE,
+        g.u_knots().to_vec(),
+        g.v_knots().to_vec(),
+    )
+}
+
 /// The polynomials whose coefficients bound the error of `G` on one patch.
 struct ErrorForms {
     /// `D'.D' - d^2 w^2`.
@@ -875,6 +998,7 @@ pub fn certified_offset(k: &Kernel, s: &Nurb, d: f64, tol: f64) -> Result<Certif
     let (sub, sub_mults) = breakpoints(s.u_knots(), p)?;
     let (svb, svb_mults) = breakpoints(s.v_knots(), q)?;
     let (ub, vb, ps, normals) = offset_base(k, s, &b)?;
+    let poles = pole_sides(&ps, &normals);
     // the joints at multiplicity p (q) proved tangent continuous (an exact extension's)
     let smooth = |mults: &[usize], deg: usize, along_u: bool| -> Result<Vec<bool>> {
         mults
@@ -908,7 +1032,7 @@ pub fn certified_offset(k: &Kernel, s: &Nurb, d: f64, tol: f64) -> Result<Certif
             }
             grid.push(row);
         }
-        let g = interpolate(&grid, &gu, &gv, &ku, &kv)?;
+        let g = flatten_pole_rings(interpolate(&grid, &gu, &gv, &ku, &kv)?, &poles)?;
         let (gub, _) = breakpoints(&ku, DEGREE)?;
         let (gvb, _) = breakpoints(&kv, DEGREE)?;
         let gp = offset_patches(&g)?;
@@ -1810,6 +1934,20 @@ mod tests {
             for d in [0.2, -0.2, 5.0] {
                 let made = certified_offset(&Kernel::default(), &s, d, 1e-4)
                     .unwrap_or_else(|e| panic!("d {d} tilted {tilted}: {e:?}"));
+                // the offset's tangent ring at the pole lies in the apex's tangent plane
+                let (base, g) = (s.cpts(), made.surface.cpts());
+                let e = |c: &CPoint| Vec3::new(c.x, c.y, c.z);
+                let (apex, ring) = (e(&base[3][0]), &base[2]);
+                let spokes = (e(&ring[0]) - apex).cross(e(&ring[3]) - apex);
+                let n = spokes * (1.0 / spokes.length());
+                let (top, below) = (&g[g.len() - 1], &g[g.len() - 2]);
+                for c in below {
+                    let off = (e(c) - e(&top[0])).dot(n).abs();
+                    assert!(
+                        off < 1e-9,
+                        "d {d} tilted {tilted}: ring {off} off the plane"
+                    );
+                }
                 assert!(made.bound <= 1e-4, "d {d} tilted {tilted}: {}", made.bound);
                 let err = sampled_error(&s, &made.surface, d);
                 assert!(err <= 1e-4, "d {d} tilted {tilted}: {err}");
