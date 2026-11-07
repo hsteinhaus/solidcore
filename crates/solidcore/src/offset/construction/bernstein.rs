@@ -368,6 +368,102 @@ impl Bernstein2 {
         let column: Vec<f64> = self.rows().map(|r| eval_1d(r, v)).collect();
         eval_1d(&column, u)
     }
+
+    /// How many lines of coefficients next to `side` are exactly zero: the power of
+    /// the side's linear form (`u`, `1 - u`, `v` or `1 - v`) the polynomial is divisible
+    /// by, as far as its coefficients show it.
+    #[must_use]
+    pub fn side_order(&self, side: PatchSide) -> usize {
+        match side {
+            PatchSide::U0 | PatchSide::U1 => self.transpose().side_order(side.transposed()),
+            PatchSide::V0 | PatchSide::V1 => {
+                let width = self.dv + 1;
+                let zero_column =
+                    |j: usize| self.rows().all(|r| r.get(j).is_some_and(|c| *c == 0.0));
+                let columns: Vec<usize> = if side == PatchSide::V0 {
+                    (0..width).collect()
+                } else {
+                    (0..width).rev().collect()
+                };
+                columns
+                    .into_iter()
+                    .take_while(|j| zero_column(*j))
+                    .count()
+                    .min(self.dv)
+            }
+        }
+    }
+
+    /// `self` divided by the `k`-th power of `side`'s linear form, exactly: the degree
+    /// along the side's direction drops by `k`, by `(1 - v) B_j^(m-1) = (m - j)/m B_j^m`
+    /// and `v B_j^(m-1) = (j + 1)/m B_(j+1)^m`.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidInput` when `k` exceeds [`Self::side_order`] (the division would not be
+    /// exact).
+    pub fn divide_side(&self, side: PatchSide, k: usize) -> Result<Self> {
+        if k > self.side_order(side) {
+            return Err(invalid(
+                "Bernstein division by a side the polynomial does not vanish on",
+            ));
+        }
+        match side {
+            PatchSide::U0 | PatchSide::U1 => Ok(self
+                .transpose()
+                .divide_side(side.transposed(), k)?
+                .transpose()),
+            PatchSide::V0 | PatchSide::V1 => {
+                let mut p = self.clone();
+                for _ in 0..k {
+                    let m = p.dv;
+                    let mf = m as f64;
+                    let mut c = Vec::with_capacity((p.du + 1) * m);
+                    for row in p.rows() {
+                        for j in 0..m {
+                            let (src, factor) = if side == PatchSide::V1 {
+                                (j, mf / (m - j) as f64)
+                            } else {
+                                (j + 1, mf / (j + 1) as f64)
+                            };
+                            c.push(row.get(src).copied().unwrap_or(0.0) * factor);
+                        }
+                    }
+                    p = Self::new(p.du, m - 1, c)?;
+                }
+                Ok(p)
+            }
+        }
+    }
+}
+
+/// A side of the parameter square: `u = 0`, `u = 1`, `v = 0` or `v = 1`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PatchSide {
+    /// `u = 0`, linear form `u`.
+    U0,
+    /// `u = 1`, linear form `1 - u`.
+    U1,
+    /// `v = 0`, linear form `v`.
+    V0,
+    /// `v = 1`, linear form `1 - v`.
+    V1,
+}
+
+impl PatchSide {
+    /// All four sides.
+    pub const ALL: [Self; 4] = [Self::U0, Self::U1, Self::V0, Self::V1];
+
+    /// The same side with `u` and `v` exchanged.
+    #[must_use]
+    pub const fn transposed(self) -> Self {
+        match self {
+            Self::U0 => Self::V0,
+            Self::U1 => Self::V1,
+            Self::V0 => Self::U0,
+            Self::V1 => Self::U1,
+        }
+    }
 }
 
 /// de Casteljau's halves of the Bernstein coefficients `c` at `t`.
@@ -534,6 +630,35 @@ mod tests {
                 assert!((sv - pq.eval(0.1 + 0.5 * u, 0.2 + 0.7 * v)).abs() < 1e-12);
                 assert!(pq.min_coefficient() <= want && want <= pq.max_coefficient());
             }
+        }
+    }
+
+    /// A polynomial times a side's linear form (squared) divides back exactly, and its
+    /// side order counts the factor.
+    #[test]
+    fn dividing_by_a_side_undoes_its_factor() {
+        let b = Binomials::new();
+        let g = poly(2, 3, |i, j| {
+            1.0 + i as f64 * 0.7 - j as f64 * 0.3 + (i * j) as f64 * 0.11
+        });
+        // u, 1 - u, v, 1 - v in Bernstein form.
+        let forms = [
+            (PatchSide::U0, poly(1, 0, |i, _| i as f64)),
+            (PatchSide::U1, poly(1, 0, |i, _| 1.0 - i as f64)),
+            (PatchSide::V0, poly(0, 1, |_, j| j as f64)),
+            (PatchSide::V1, poly(0, 1, |_, j| 1.0 - j as f64)),
+        ];
+        for (side, l) in forms {
+            assert_eq!(g.side_order(side), 0);
+            let once = g.mul(&l, &b).unwrap();
+            let twice = once.mul(&l, &b).unwrap();
+            assert_eq!(twice.side_order(side), 2, "{side:?}");
+            let back = twice.divide_side(side, 2).unwrap();
+            assert_eq!(back.degrees(), g.degrees());
+            for (x, y) in back.coefficients().iter().zip(g.coefficients()) {
+                assert!((x - y).abs() < 1e-12, "{side:?}: {x} vs {y}");
+            }
+            assert!(once.divide_side(side, 2).is_err(), "only once divisible");
         }
     }
 
