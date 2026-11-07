@@ -521,6 +521,8 @@ pub fn transform_matrix_with_notifications(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::curve::curve::{Curve, CurveKind};
+    use crate::curve::line::Line;
     use crate::primitive::api_primitives::create_box;
     use crate::topology::brep::p1;
 
@@ -558,6 +560,60 @@ mod tests {
         mirror(&mut k, &mut b, &plane).unwrap();
         for (&v, p) in vertices.iter().zip(&before) {
             assert!((b.vertex(v).unwrap().point - *p).length() < 1e-12);
+        }
+    }
+
+    /// A mirrored line is a line, exact along its edge: as the NURB of its whole analytic
+    /// domain (upstream's mirror) its points were good to some 1e-8 only, and a curve
+    /// crossing it there was filtered out as not exact (a SolidCraft part's union of a
+    /// mirrored plate, a crossing missed on the plate's face, the face classification
+    /// failing with status 1001).
+    #[test]
+    fn a_mirrored_box_keeps_exact_line_edges() {
+        let mut k = Kernel::default();
+        let mut b = create_box(&mut k, Vec3::new(1.0, 2.0, 3.0), 40.0, 30.0, 0.5).unwrap();
+        // a plane through the origin, slanted against every axis
+        let plane = Axis2Placement::new(
+            Vec3::ZERO,
+            Vec3::new(1.0, 1.0, 0.0).unitize().unwrap(),
+            Vec3::new(-1.0, 1.0, 2.0).unitize().unwrap(),
+        );
+        mirror(&mut k, &mut b, &plane).unwrap();
+        for e in p1::edges(&b, None).unwrap() {
+            let edge = b.edge(e).unwrap();
+            let curve = edge.curve.as_ref().unwrap();
+            assert!(
+                matches!(curve.kind(), CurveKind::Line(_)),
+                "{:?}",
+                curve.kind()
+            );
+            for t in [edge.interval.min(), edge.interval.max()] {
+                let p = curve.evaluate_point(&k, t).unwrap();
+                let gap = p1::vertices(&b, None)
+                    .unwrap()
+                    .iter()
+                    .map(|&v| (b.vertex(v).unwrap().point - p).length())
+                    .fold(f64::INFINITY, f64::min);
+                assert!(gap < 1e-12, "edge end {gap} from its vertex");
+            }
+        }
+        // an unbounded line (an extruded profile's edges are): exact where an edge uses it
+        let line = Curve::from(Line::infinite(
+            Vec3::new(45.6, 0.0, 0.5),
+            Vec3::new(-45.6, 0.0, 0.0),
+            3,
+            false,
+        ));
+        let mirrored = line.create_mirror_curve(&k, &plane).unwrap();
+        assert!(matches!(mirrored.kind(), CurveKind::Line(_)));
+        for t in [0.0, 0.25, 0.6437, 1.0] {
+            let want = plane.mirror_point(line.evaluate_point(&k, t).unwrap());
+            let got = mirrored.evaluate_point(&k, t).unwrap();
+            assert!(
+                (got - want).length() < 1e-12,
+                "{t}: {}",
+                (got - want).length()
+            );
         }
     }
 }
