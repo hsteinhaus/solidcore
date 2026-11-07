@@ -1577,10 +1577,11 @@ impl Curve {
                     objects,
                 )?;
                 if !found {
-                    // curves within tolerance but no nearest point found
-                    return Err(SolidError::sm_err(
-                        "curve::simple_coincidence_checker (nearest)",
-                    ));
+                    // no minimum inside: the separation runs one way over the interval, and
+                    // the curves come nearest at the end where it is smaller
+                    let (da, db) = (separation_a.length(), separation_b.length());
+                    let end = if da <= db { first } else { last };
+                    return Ok(vec![pair_solution(objects, end, None)]);
                 }
                 nearest.num_variables = 2;
                 nearest.num_objects = 2;
