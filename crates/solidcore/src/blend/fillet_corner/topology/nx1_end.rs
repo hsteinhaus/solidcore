@@ -169,6 +169,62 @@ fn pseudo_edge(edge: EdgeId) -> FilletObject {
     FilletObject::Topology(FilletBody::Pseudo, EntityRef::Edge(edge))
 }
 
+/// `surface` extended on all sides by `ext_dist` as an end face's surface is, copied as
+/// an analytic surface when possible.
+fn extended_end_surface(
+    k: &Kernel,
+    surface: &Surface,
+    extension: crate::surface::extend::Continuity,
+    ext_dist: f64,
+) -> Result<Surface> {
+    let new_surface = surface
+        .extended_sides(k, &crate::surface::side::BoxSide::ALL, extension, ext_dist)?
+        .surface;
+    // Copy pNewSurface, when possible as an analytic surface
+    new_surface.copy_and_add_analytics(k)
+}
+
+/// Whether the extended surface of the face of `pick` holds the edge of `other` to
+/// within `tol` (the session's `SimpleCoincidenceChecker` of the end face's extended
+/// surface against the other side edge, a failing status read as not holding).
+fn extension_holds_edge(
+    k: &Kernel,
+    target: &Brep,
+    pick: EdgeuseId,
+    other: EdgeuseId,
+    extension: crate::surface::extend::Continuity,
+    ext_dist: f64,
+    tol: f64,
+) -> Result<bool> {
+    let (Some(face), Some(other_edge)) = (eu1::face(target, pick)?, eu1::edge(target, other)?)
+    else {
+        return Ok(false);
+    };
+    let (Some(surface), Some(curve)) = (
+        target.face(face)?.surface.as_ref(),
+        edge::curve(target, other_edge)?,
+    ) else {
+        return Ok(false);
+    };
+    let Some(extended) =
+        crate::error::ignored(extended_end_surface(k, surface, extension, ext_dist))?
+    else {
+        return Ok(false);
+    };
+    let found = crate::error::ignored(
+        extended.simple_coincidence_checker::<crate::topology::ObjectHandle>(
+            k,
+            &extended.natural_uv_domain_with_nurb(k)?,
+            curve,
+            &edge::interval(target, other_edge)?,
+            tol,
+            false,
+            [None, None],
+        ),
+    )?;
+    Ok(found.flatten().is_some())
+}
+
 impl FilletCorner {
     /// From the extension distance on: the end rib, its end face, the extended end
     /// surface and, at a mixed-convexity corner, the vertex on the original vertex and
@@ -216,6 +272,15 @@ impl FilletCorner {
         pseudo.set_edgeuse_fillet_geom(primary, Some(geometry))?;
         self.edges.push(rib);
 
+        // At a tangent end the end face is continued as itself: the end rib's shape
+        // there depends on how its curvature differs from the rail's face across the
+        // seam, which a linear (G1) extension would not keep (tangency-labs/smlib@856b54e).
+        let extension = if mixed && (tangent_side[0] || tangent_side[1]) {
+            crate::surface::extend::Continuity::Natural
+        } else {
+            crate::surface::extend::Continuity::Tangent
+        };
+
         // In the mixed-cvxty case, pEndFace will be NULL when we arrive here
         // if both side edges have opposite convexity to the filleted edge.
         let mut multi_neighbor_end_face = false;
@@ -232,8 +297,27 @@ impl FilletCorner {
                     } else if same[1] {
                         (second, first)
                     } else {
-                        // both are cliff edges, just pick one.
-                        (first, second)
+                        // both are cliff edges: the end face is the one whose extended
+                        // surface holds the other side edge, as the gap check after the
+                        // topology requires (not upstream, WR-755: upstream picks the
+                        // first, which is the rail-1 side, so a body and its mirror
+                        // image pick different faces)
+                        let holds = |pick: EdgeuseId, other: EdgeuseId| {
+                            extension_holds_edge(
+                                k,
+                                target,
+                                pick,
+                                other,
+                                extension,
+                                ext_dist,
+                                self.approx_tol_3d,
+                            )
+                        };
+                        if !holds(first, second)? && holds(second, first)? {
+                            (second, first)
+                        } else {
+                            (first, second)
+                        }
                     };
                     end_face = eu1::face(target, pick)?;
                     extend_edge = eu1::edge(target, pick)?;
@@ -263,19 +347,7 @@ impl FilletCorner {
                 "end face without surface",
             )?;
             // create an extended surface large enough to fill in the endCap requirements
-            // At a tangent end the end face is continued as itself: the end rib's shape
-            // there depends on how its curvature differs from the rail's face across the
-            // seam, which a linear (G1) extension would not keep (tangency-labs/smlib@856b54e).
-            let extension = if mixed && (tangent_side[0] || tangent_side[1]) {
-                crate::surface::extend::Continuity::Natural
-            } else {
-                crate::surface::extend::Continuity::Tangent
-            };
-            let new_surface = surface
-                .extended_sides(k, &crate::surface::side::BoxSide::ALL, extension, ext_dist)?
-                .surface;
-            // Copy pNewSurface, when possible as an analytic surface
-            let new_extend_surface = new_surface.copy_and_add_analytics(k)?;
+            let new_extend_surface = extended_end_surface(k, surface, extension, ext_dist)?;
             // If AddExtendedOriginalSurface() deleted pNewExtendSurface, then
             // pEndFace already had an extended surface, and we don't have to
             // deal with it anymore.
