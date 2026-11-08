@@ -454,6 +454,10 @@ pub struct ClassInputsRecord {
     pub ball_on_collapsed: bool,
     /// Whether the radii can change along the edge.
     pub radii_can_change: bool,
+    /// The filleted edge's unit direction at its point nearest the centre (WR-757); absent
+    /// in records written before it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub along: Option<[f64; 3]>,
 }
 
 /// A round of an exact class (#2485): its definition (supports, ball, section, leader and

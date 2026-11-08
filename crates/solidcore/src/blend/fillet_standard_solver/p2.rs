@@ -3529,6 +3529,7 @@ fn chord_between_planes(
         tol,
         ball_on_collapsed: false,
         radii_can_change: false,
+        along: None,
     };
     let round = ExactRound::chord(k, bases, chamfer, Some(&leader), inputs)?;
     let mut surface = Surface::from(plane);

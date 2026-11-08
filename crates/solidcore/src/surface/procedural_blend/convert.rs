@@ -31,7 +31,7 @@ use crate::blend::fillet_section::station::as_b_spline;
 use crate::error::{EntityRef, Result, SolidError, SM_ERR_INVALID_INPUT};
 use crate::geom::vector2d::Point2;
 use crate::kernel::Kernel;
-use crate::math::Point3;
+use crate::math::{Point3, Vec3};
 use crate::nurbs::b_spline_curve::BSplineCurve;
 use crate::nurbs::b_spline_surface::BSplineSurface;
 use crate::nurbs::b_spline_surface::SurfParamType;
@@ -464,6 +464,7 @@ pub fn exact_to_record(k: &Kernel, surface: &Surface) -> Result<ExactRoundRecord
             tol: i.tol,
             ball_on_collapsed: i.ball_on_collapsed,
             radii_can_change: i.radii_can_change,
+            along: i.along.map(|t| [t.x, t.y, t.z]),
         },
         chamfer: round.chamfer.map(chamfer_record),
         leader_map: LeaderMapRecord {
@@ -536,6 +537,7 @@ pub fn exact_from_record(k: &Kernel, rec: &ExactRoundRecord) -> Result<Surface> 
         tol: i.tol,
         ball_on_collapsed: i.ball_on_collapsed,
         radii_can_change: i.radii_can_change,
+        along: i.along.map(|t| Vec3::new(t[0], t[1], t[2])),
     };
     let class = match rec.class {
         ExactClassRecord::Line => ExactClass::Line,
