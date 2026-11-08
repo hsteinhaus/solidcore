@@ -1064,7 +1064,13 @@ pub fn certified_offset(k: &Kernel, s: &Nurb, d: f64, tol: f64) -> Result<Certif
                     w: spatch.w.as_ref().map(|w| w.restrict(s0, s1, t0, t1)),
                 };
                 // the tangents of the base patch, restricted: exact zeros along a pole kept
-                let (au, av) = homogeneous_tangents(spatch, &b)?;
+                // (WR-759: read with the pole at the origin, where a rational side's
+                // homogeneous points vanish exactly; the tangents do not change with the
+                // move)
+                let (au, av) = homogeneous_tangents(
+                    &regular_poles_at_origin(spatch, k.tolerances.zone_tol_3d)?,
+                    &b,
+                )?;
                 let tangents = (
                     restrict3(&au, s0, s1, t0, t1),
                     restrict3(&av, s0, s1, t0, t1),
