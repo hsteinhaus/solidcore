@@ -707,6 +707,11 @@ fn untagged(b: &mut Brep) -> solidcore::Result<()> {
     Ok(())
 }
 
+/// The tangency (radians) within which [`overflow_first`] takes asked rounds as one chain:
+/// the executive's default, at which its corners end a round running on into another at a
+/// smooth vertex (`SetFilletParameters`' 10 degrees).
+const CHAIN_TANGENCY: f64 = 10.0 * (std::f64::consts::PI / 180.0);
+
 /// The rounds of [`blend`] when blends of several edges overflow their faces (the first call
 /// stopped in `b`, `edges` its edges, `sizes` theirs, `mitred` the mitred pairs it found): the
 /// blends that overflow on their own (each edge's alone, classified in `b`, where nothing was
@@ -715,7 +720,7 @@ fn untagged(b: &mut Brep) -> solidcore::Result<()> {
 /// ([`Picked`]). Each other asked edge is then what is left of it, the edges carrying its tag,
 /// rounded at its size in a second pass that is handed the faces the first made, so it meets
 /// the first rounds as one blend. An asked edge with nothing left is `dropped`. Two rounds
-/// mitred at a face's concave corner go first together. Where none overflows on its own, or
+/// mitred at a face's concave corner go first together, and so do rounds of one tangent chain. Where none overflows on its own, or
 /// all do, the edges are rounded together as before. The result is `fresh`, untagged.
 #[allow(clippy::too_many_arguments)] // the C API's overflow_first
 fn overflow_first(
@@ -773,7 +778,7 @@ fn overflow_first(
     }
     // a round mitred to one that goes first goes with it, through every mitre
     let place = |e: &EdgeId| edges.iter().position(|p| p == e);
-    let pairs: Vec<(usize, usize)> = mitred
+    let mut pairs: Vec<(usize, usize)> = mitred
         // two by two (an odd last one is no pair); the chunk size 2 is not 0: cannot panic
         .chunks_exact(2)
         .filter_map(|pair| match pair {
@@ -781,6 +786,12 @@ fn overflow_first(
             _ => None,
         })
         .collect();
+    // and so does a round running on tangentially into one that goes first: apart, each
+    // would end at their smooth vertex, which no End builds (a rail rolling over into it)
+    for (i, &e) in edges.iter().enumerate() {
+        let chain = solidcore::blend::blend_refusal::tangent_chain(k, b, &[e], CHAIN_TANGENCY)?;
+        pairs.extend(chain.iter().filter_map(place).map(|j| (i, j)));
+    }
     let mut grew = true;
     while grew {
         grew = false;
