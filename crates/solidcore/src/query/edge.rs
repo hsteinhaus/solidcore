@@ -914,7 +914,9 @@ pub fn radial_sector_classify_between(
 ///
 /// # Errors
 ///
-/// `SM_ERR` when the curve's projected direction vanishes; `SM_ERR_INVALID_INPUT` (as
+/// `SM_ERR` when the curve's projected direction vanishes, or the curve keeps within the
+/// edge's tolerance of the edge's line (it leaves along the edge, into no sector);
+/// `SM_ERR_INVALID_INPUT` (as
 /// [`SolidError::Upstream`]) for a zero-length vector to unitize or measure;
 /// [`SolidError::InvalidInput`]
 /// for a sector edge use without radial partner; those of the step-offs and
@@ -935,6 +937,7 @@ pub fn radial_sector_of_curve_classify(
     let eu_radial = eu1::radial(brep, sector_eu)?
         .ok_or_else(|| null(OP_RADIAL_CURVE, "edge use without radial"))?;
     let tolerance = brep.edge(edge)?.tolerance;
+    let (curve_length, _) = curve.approximate_length(k, interval, 10, false)?;
     let same = orientation == OrientType::Same;
     let start_param = if same { interval.min() } else { interval.max() };
     let mut done = false;
@@ -1000,7 +1003,12 @@ pub fn radial_sector_of_curve_classify(
         let norm1 = vec_status(norm1.unitize(), OP_RADIAL_CURVE)?;
         let bin2 = tan1.cross(s2.binormal).cross(tan1);
         let bin3 = tan1.cross(tan).cross(tan1);
-        if bin3.length_squared() < EFF_ZERO_SQ {
+        // the curve leaves along the edge, into no sector, when it keeps within the edge's
+        // tolerance of the edge's line over its length (sin of its angle to the edge times
+        // its length): its sector would be read from rounding
+        if bin3.length_squared() < EFF_ZERO_SQ
+            || bin3.length() / tan.length() * curve_length <= tolerance
+        {
             return Err(SolidError::sm_err(OP_RADIAL_CURVE));
         }
 
