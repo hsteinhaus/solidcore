@@ -11,7 +11,7 @@
     clippy::panic,
     clippy::indexing_slicing
 )] // test helpers
-use solidcore::boolean::api_brep::boolean_union;
+use solidcore::boolean::api_brep::{boolean_difference, boolean_union};
 use solidcore::geom::attribute::{AttributeStore, ObjectKey};
 use solidcore::kernel::UpstreamFixes;
 use solidcore::mass::integrator::properties::{brep_volume, PropertyAttributes};
@@ -25,11 +25,42 @@ use solidcore::Kernel;
 /// SolidCraft's fixes (every one but the two it holds back): the result's faces and
 /// volume.
 fn shell(plate: f64) -> (usize, f64) {
+    shell_cut(plate, false)
+}
+
+/// [`shell`], with `chamfer`: the plate's corner at (20, 20) cut off at 45 degrees, 3 along
+/// each side.
+fn shell_cut(plate: f64, chamfer: bool) -> (usize, f64) {
     let mut k = Kernel::default();
     k.fixes = UpstreamFixes::all();
     k.fixes.fillet_refuse_rounds_breaking_through = false;
     k.fixes.fillet_round_ends_on_outline = false;
-    let base = create_box(&mut k, Point3::new(0.0, 0.0, 0.0), 20.0, 20.0, plate).unwrap();
+    let mut base = create_box(&mut k, Point3::new(0.0, 0.0, 0.0), 20.0, 20.0, plate).unwrap();
+    if chamfer {
+        // a square of diagonal 6 about the corner, turned 45 degrees
+        let side = 6.0 / 2f64.sqrt();
+        let mut cut = create_box(
+            &mut k,
+            Point3::new(-side / 2.0, -side / 2.0, -1.0),
+            side,
+            side,
+            plate + 2.0,
+        )
+        .unwrap();
+        let (c, s) = (
+            std::f64::consts::FRAC_PI_4.cos(),
+            std::f64::consts::FRAC_PI_4.sin(),
+        );
+        let turn = [
+            [c, -s, 0.0, 20.0],
+            [s, c, 0.0, 20.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        solidcore::topology::brep::mirror::transform_matrix(&mut k, &mut cut, &turn, false)
+            .unwrap();
+        base = boolean_difference(&mut k, base, cut).unwrap();
+    }
     let tower = create_box(&mut k, Point3::new(5.0, 5.0, plate), 10.0, 10.0, 10.0).unwrap();
     let b = boolean_union(&mut k, base, tower).unwrap();
     // the bottom, at z 0
@@ -78,4 +109,15 @@ fn a_plate_thicker_than_the_wall_is_shelled_as_before() {
     let (faces, v) = shell(1.0);
     assert_eq!(faces, 21);
     assert!((v - 409.5).abs() < 1e-6, "{v}");
+}
+
+/// The same with the plate's corner cut off at 45 degrees: there the cut's offset runs out
+/// along the bottom past where the next side's offset comes back along it (a slit along
+/// part of an edge). 20 x 20 - 4.5 = 395.5 of plate, 0.5 thick, + 1000 - 810 = 387.75,
+/// 17 faces.
+#[test]
+fn a_wall_as_thick_as_a_cut_plate_leaves_the_plate() {
+    let (faces, v) = shell_cut(0.5, true);
+    assert_eq!(faces, 17);
+    assert!((v - 387.75).abs() < 1e-6, "{v}");
 }
