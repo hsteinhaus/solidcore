@@ -107,3 +107,14 @@ fn each_valley_s_round_follows_its_own_conic() {
         assert!((added - 5.1874).abs() < 1e-4, "{dir:?}: {added}");
     }
 }
+
+/// Fusion's Fillet2 whole, the four valleys in one call (WR-758): at the crossing's top every
+/// round has lost its width, the arms' faces tangent there, and the rounds meet in the point
+/// with no corner patch. The adjacent valleys' corner there was refused (an Nx2 corner, no
+/// topology). 25 + 8 faces, 39383.603 + 4 x 5.1874 = 39404.352 mm3, Fusion's.
+#[test]
+fn the_four_valleys_round_as_fusion_s_fillet2() {
+    let (added, faces) = round(&VALLEYS);
+    assert_eq!(faces, 8);
+    assert!((added - 4.0 * 5.1874).abs() < 4e-4, "{added}");
+}
