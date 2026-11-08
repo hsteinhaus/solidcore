@@ -1289,4 +1289,56 @@ mod tests {
         assert_eq!(RadialSectorClass::ZeroSectorMate.code(), 7);
         assert_eq!(CurveSectorClass::CoincidentRadial.code(), 3);
     }
+
+    /// A SolidCraft body (`.smb`, binary) from `tests/data`.
+    fn solidcraft_body(k: &mut Kernel, bytes: &[u8]) -> Brep {
+        use crate::geom::attribute::{AttributeStore, ObjectKey};
+        use crate::geom::object::ObjectRef;
+        use crate::topology::api_files::read_brep_from_file;
+        use crate::topology::brep::p10::TopologyEnv;
+        use crate::topology::topology::NotifyRecords;
+        let mut attributes = AttributeStore::default();
+        let mut records = NotifyRecords::new();
+        // the entities named as SolidCraft names them, as its dump was read
+        let key = |entity: crate::EntityRef| {
+            let r = crate::topology::brep::p3::topology_ref(0, entity);
+            ObjectRef {
+                type_code: r.type_code,
+                key: ObjectKey(r.type_code.unsigned_abs() * 1_000_000 + (r.key.0 & 0xffff_ffff)),
+            }
+        };
+        let mut env = TopologyEnv {
+            all_attributes: &[],
+            attributes: &mut attributes,
+            key_of: &key,
+            records: &mut records,
+            next_key: 1 << 40,
+        };
+        let mut b = read_brep_from_file(k, Some(bytes.to_vec()), false, false, &mut env).unwrap();
+        b.refresh_cached_topology();
+        b
+    }
+
+    /// A curve that runs along an edge's line within the edge's tolerance leaves into no
+    /// radial sector of it. A strut 9 mm clear of a tube end (SolidCraft's Motortraeger,
+    /// both made by extrusion): the ray classifying the strut runs from it along the
+    /// line of a tube end edge, 1e-12 rad off it, to the edge's vertex. That edge's
+    /// sector, read from the rounding, made the strut lie inside the tube, and the union
+    /// dropped it.
+    #[test]
+    fn a_union_keeps_a_body_whose_ray_runs_along_an_edge() {
+        let mut k = Kernel::default();
+        let tube = solidcraft_body(
+            &mut k,
+            include_bytes!("../../tests/data/solidcraft_motortraeger_tube_end.smb"),
+        );
+        let strut = solidcraft_body(
+            &mut k,
+            include_bytes!("../../tests/data/solidcraft_motortraeger_strut.smb"),
+        );
+        let faces = |b: &Brep| crate::topology::brep::p1::faces(b, None).unwrap().len();
+        assert_eq!((faces(&tube), faces(&strut)), (6, 5));
+        let united = crate::boolean::api_brep::boolean_union(&mut k, tube, strut).unwrap();
+        assert_eq!(faces(&united), 11);
+    }
 }
