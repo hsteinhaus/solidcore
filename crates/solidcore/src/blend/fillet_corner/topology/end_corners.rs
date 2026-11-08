@@ -358,13 +358,6 @@ impl FilletCorner {
             solver_eu_solvers,
             ..
         } = env;
-        let fil_edgeuse = self.filleted_eu(0)?;
-        // Adjacent edgeuses of filleted edgeuse
-        let eus = [
-            eu1::cw_edgeuse(target, fil_edgeuse)?,
-            eu1::ccw_edgeuse(target, radial(target, fil_edgeuse)?)?,
-        ];
-        let solver_id = solver_eu_solvers.first().copied().flatten();
         let cp_vertex = need(self.vertex, "corner without vertex")?;
         let fv = new_corner_vertex(k, pseudo, corner)?;
         let corner_pnt = target.vertex(cp_vertex)?.point;
@@ -379,62 +372,74 @@ impl FilletCorner {
             .set_status(FilStatus::Processed);
         self.vertices.push(fv);
 
-        // Drop sCornerPnt onto 2 surfaces
-        let solver = live(solvers, solver_id)?;
-        let tol = vertex::tolerance(target, cp_vertex)? * 10.0;
-        let mut uv = [Point2::ZERO; 2];
-        for (ii, slot) in uv.iter_mut().enumerate() {
-            let base = solver
-                .surface(ii)?
-                .ok_or_else(|| SolidError::null_pointer(OP))?
-                .surface
-                .base_surface();
-            // Point testing off: GlobalPointSolve keeps every point solution.
-            let solutions = base.global_point_solve_point_test_off::<ObjectHandle>(
-                k,
-                None,
-                &base.natural_uv_domain_with_nurb(k)?,
-                SolverOperation::Intersect,
-                corner_pnt,
-                tol,
-                None,
-                SolutionRequested::Single,
-            )?;
-            let [solution] = solutions.as_slice() else {
-                return Err(SolidError::sm_err(OP));
-            };
-            *slot = Point2::new(solution.start.param(0)?, solution.start.param(1)?);
-        }
-
-        let fillet_geom = solver.first_fillet_geom()?;
-        for eu in eus {
-            let eu = need(eu, "filleted edge use without neighbour")?;
-            let rail = solver.find_index_of_rail_x_side_edgeuse(target, eu)?;
-            let other = 1usize
-                .checked_sub(rail)
-                .ok_or_else(|| invalid("rail index past 1"))?;
-            // Create rail-edgeuse using this vertex
-            let new_edgeuse = pseudo.make_rail_edgeuse_on(
-                fillet_geom,
-                rail,
-                Some(fv),
-                OrientType::Unknown,
-                None,
-                lookup(corner, self),
-                solver,
-                target,
-            )?;
-            let vu = need(
-                eu1::vertexuse(pseudo.brep(), new_edgeuse)?,
-                "rail edge use without vertex use",
-            )?;
-            let mut tsect = pseudo.fillet_vertexuse(vu)?.tsect_pnt().clone();
-            for i in [rail, other] {
-                *tsect.uv_pos_mut(srf(i)?) =
-                    *uv.get(i).ok_or_else(|| invalid("rail index past 1"))?;
+        // Not the fork (WR-758): every round the corner ends (several where all lose their
+        // width at the vertex) ends at that one fillet vertex
+        let rounds = self.solver_eus.as_deref().map_or(0, <[EdgeuseId]>::len);
+        for index in 0..rounds {
+            let fil_edgeuse = self.filleted_eu(index)?;
+            // Adjacent edgeuses of filleted edgeuse
+            let eus = [
+                eu1::cw_edgeuse(target, fil_edgeuse)?,
+                eu1::ccw_edgeuse(target, radial(target, fil_edgeuse)?)?,
+            ];
+            let solver_id = solver_eu_solvers.get(index).copied().flatten();
+            // Drop sCornerPnt onto 2 surfaces
+            let solver = live(solvers, solver_id)?;
+            let tol = vertex::tolerance(target, cp_vertex)? * 10.0;
+            let mut uv = [Point2::ZERO; 2];
+            for (ii, slot) in uv.iter_mut().enumerate() {
+                let base = solver
+                    .surface(ii)?
+                    .ok_or_else(|| SolidError::null_pointer(OP))?
+                    .surface
+                    .base_surface();
+                // Point testing off: GlobalPointSolve keeps every point solution.
+                let solutions = base.global_point_solve_point_test_off::<ObjectHandle>(
+                    k,
+                    None,
+                    &base.natural_uv_domain_with_nurb(k)?,
+                    SolverOperation::Intersect,
+                    corner_pnt,
+                    tol,
+                    None,
+                    SolutionRequested::Single,
+                )?;
+                let [solution] = solutions.as_slice() else {
+                    return Err(SolidError::sm_err(OP));
+                };
+                *slot = Point2::new(solution.start.param(0)?, solution.start.param(1)?);
             }
-            tsect.point_type = IntersectionPointType::TangentPoint;
-            pseudo.fillet_vertexuse_mut(vu)?.set_tsect_pnt(&tsect);
+
+            let fillet_geom = solver.first_fillet_geom()?;
+            for eu in eus {
+                let eu = need(eu, "filleted edge use without neighbour")?;
+                let rail = solver.find_index_of_rail_x_side_edgeuse(target, eu)?;
+                let other = 1usize
+                    .checked_sub(rail)
+                    .ok_or_else(|| invalid("rail index past 1"))?;
+                // Create rail-edgeuse using this vertex
+                let new_edgeuse = pseudo.make_rail_edgeuse_on(
+                    fillet_geom,
+                    rail,
+                    Some(fv),
+                    OrientType::Unknown,
+                    None,
+                    lookup(corner, self),
+                    solver,
+                    target,
+                )?;
+                let vu = need(
+                    eu1::vertexuse(pseudo.brep(), new_edgeuse)?,
+                    "rail edge use without vertex use",
+                )?;
+                let mut tsect = pseudo.fillet_vertexuse(vu)?.tsect_pnt().clone();
+                for i in [rail, other] {
+                    *tsect.uv_pos_mut(srf(i)?) =
+                        *uv.get(i).ok_or_else(|| invalid("rail index past 1"))?;
+                }
+                tsect.point_type = IntersectionPointType::TangentPoint;
+                pseudo.fillet_vertexuse_mut(vu)?.set_tsect_pnt(&tsect);
+            }
         }
         Ok(())
     }

@@ -870,6 +870,29 @@ impl FilletCorner {
             c
         };
 
+        // Not the fork (WR-758): rounds that all lose their width at the vertex (the faces
+        // either side of each tangent there, as where crossing tubes' valleys meet at the
+        // crossing's top) meet in the point only: one degenerate corner ends them all there,
+        // with no patch
+        if total_solver_eus > 1 {
+            let mut all_degenerate = true;
+            for &eu in solver_eus {
+                if !check_nx1_degeneracy(k, b, vertex, eu)? {
+                    all_degenerate = false;
+                    break;
+                }
+            }
+            if all_degenerate {
+                let mut c = make(FilletCornerKind::Degenerate);
+                c.blend = Some(crate::blend::blend_corner::BlendCorner {
+                    event: BlendCornerEvent::End,
+                    turn: crate::blend::blend_corner::BlendTurn::Mitre,
+                    end: BlendEnd::RunsOut,
+                });
+                return Ok(Some(c));
+            }
+        }
+
         // switch on number of to-be-filleted edgeuses connected to vertex
         let corner = match total_solver_eus {
             0 => None,
