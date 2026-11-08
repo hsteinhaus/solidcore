@@ -1502,6 +1502,19 @@ impl OffsetSurface {
                     "pole step-off recursion deeper than MAX_STEPOFF_DEPTH",
                 ));
             }
+            let exact = exact_at_pole(
+                k,
+                surface,
+                &domain,
+                uv,
+                [u_side, v_side],
+                offset_distance,
+                b,
+                bu_len < bv_len,
+                hv,
+                tol,
+                true,
+            )?;
             let param_step =
                 find_nonsingular_stepoff(k, surface, cr_uv, &domain, bu_len, bv_len, tol)?;
 
@@ -1587,6 +1600,12 @@ impl OffsetSurface {
             }
             if hv >= 3 {
                 put(out, 3, extrapolate(3)?)?;
+            }
+            if let Some((point, along)) = exact {
+                put(out, 0, point)?;
+                if let Some((idx, d)) = along {
+                    put(out, idx, d)?;
+                }
             }
             return Ok(());
         }
@@ -1722,6 +1741,31 @@ impl OffsetSurface {
             put(out, 3, d(2, 1)? + offset_distance * nvvv)?;
         }
 
+        // (WR-761) a Simple evaluation at a pole of the base: the offset's point and its
+        // derivative along the collapsed side from the base's normal there
+        if do_eval_simple && (bu_len < tol || bv_len < tol) {
+            let exact = exact_at_pole(
+                k,
+                surface,
+                &domain,
+                uv,
+                [u_side, v_side],
+                offset_distance,
+                b,
+                bu_len < bv_len,
+                hv,
+                tol,
+                false,
+            )?;
+            if let Some((point, along)) = exact {
+                put(out, 0, point)?;
+                if let Some((idx, d)) = along {
+                    if (idx == 1 && hv >= 1) || (idx == hv + 1 && hu >= 1) {
+                        put(out, idx, d)?;
+                    }
+                }
+            }
+        }
         if !do_eval_simple {
             // replace zero first derivatives by short base tangents
             let tolerance = EFF_ZERO * (1.0 + get(out, 0)?.max_dimension());
@@ -3161,6 +3205,77 @@ fn extend_surface(
     Ok(Some(Surface::from(BSplineSurface::from_gw_nurb(
         &ext.surface,
     ))))
+}
+
+/// Not upstream (WR-761): at a pole of the base (a side along which one base derivative
+/// vanishes), the offset's point and its derivative along the collapsed side (with its
+/// index in the outputs) from the base's own normal there ([`Surface::evaluate_normal`], its
+/// limit at the pole), in place of the step-off extrapolation: the point is `B + d n`, and
+/// the derivative is `d` times the normal's change along the side (a central difference).
+/// At a regular pole (one tangent plane) the normal does not change along the side, so the
+/// offset of the pole is one point and the side collapses, as the base's does; at a cone's
+/// apex it changes, and the offset's side is the circle it is. `None` (the extrapolation
+/// stands) where the base's normal cannot be evaluated.
+///
+/// # Errors
+///
+/// Unported or cancelled evaluations.
+#[allow(clippy::too_many_arguments)]
+fn exact_at_pole(
+    k: &Kernel,
+    surface: &Surface,
+    domain: &Extent2d,
+    uv: Point2,
+    [u_side, v_side]: [Side; 2],
+    offset_distance: f64,
+    b: Vec3,
+    u_collapsed: bool,
+    hv: usize,
+    tol: f64,
+    floor: bool,
+) -> Result<Option<(Vec3, Option<(usize, Vec3)>)>> {
+    let normal = |p: Point2| -> Result<Option<Vec3>> {
+        ignored(surface.evaluate_normal(k, p, u_side, v_side))
+    };
+    let Some(n) = normal(uv)? else {
+        return Ok(None);
+    };
+    let point = b + offset_distance * n;
+    // where u's derivative vanishes the collapsed side runs along u (v fixed), where v's
+    // does along v
+    let (lo, hi, t) = if u_collapsed {
+        (domain.min().x, domain.max().x, uv.x)
+    } else {
+        (domain.min().y, domain.max().y, uv.y)
+    };
+    let at = |t: f64| {
+        if u_collapsed {
+            Point2::new(t, uv.y)
+        } else {
+            Point2::new(uv.x, t)
+        }
+    };
+    let h = 1e-4 * (hi - lo);
+    let (t0, t1) = ((t - h).max(lo), (t + h).min(hi));
+    if !(t1 > t0) {
+        return Ok(Some((point, None)));
+    }
+    let (Some(n0), Some(n1)) = (normal(at(t0))?, normal(at(t1))?) else {
+        return Ok(Some((point, None)));
+    };
+    let mut along = (n1 - n0) * (offset_distance / (t1 - t0));
+    // never a zero first derivative where not doing a Simple evaluation
+    if floor && along.length() < tol {
+        along = along.unitize_or_z() * (tol * 1.1);
+    }
+    let slot = if u_collapsed {
+        Some(hv + 1)
+    } else if hv >= 1 {
+        Some(1)
+    } else {
+        None
+    };
+    Ok(Some((point, slot.map(|i| (i, along)))))
 }
 
 /// `sm_FindNonsingularStepoff`: at a pole of `surface` (a first derivative shorter than
