@@ -2004,6 +2004,24 @@ mod tests {
         }
     }
 
+    /// The rational dome's offset through its pole is certified as the polynomial one's is
+    /// (WR-759): the pole normals are read with the pole at the origin, where its rational
+    /// side's homogeneous points vanish exactly, not at the side's mean, where they leave
+    /// the normal 0 at the pole (`Degenerate`).
+    #[test]
+    fn weighted_domed_quarter_offset_is_certified_through_its_pole() {
+        for tilted in [false, true] {
+            let s = weighted_domed_quarter(tilted);
+            for d in [0.2, -0.2] {
+                let made = certified_offset(&Kernel::default(), &s, d, 1e-4)
+                    .unwrap_or_else(|e| panic!("d {d} tilted {tilted}: {e:?}"));
+                assert!(made.bound <= 1e-4, "d {d} tilted {tilted}: {}", made.bound);
+                let err = sampled_error(&s, &made.surface, d);
+                assert!(err <= 1e-4, "d {d} tilted {tilted}: {err}");
+            }
+        }
+    }
+
     /// The domed quarter cut into two Bezier pieces round its axis (a knot of full
     /// multiplicity in v, as a loft through sections stores it): the joint between them
     /// runs into the pole, where both one-sided normals vanish. It is no crease there; the
