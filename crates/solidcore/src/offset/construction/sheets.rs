@@ -1431,6 +1431,7 @@ fn regular_poles(patch: &Patch, tol: f64, frame: bool) -> Result<Patch> {
             .iter()
             .fold(Vec3::new(0.0, 0.0, 0.0), |a, &i| a + at(&e, i))
             * (1.0 / n);
+        let mut at_origin = false;
         if frame && !framed {
             // the tangent plane: the ring's spokes from the pole, summed pairwise
             let mut normal = Vec3::new(0.0, 0.0, 0.0);
@@ -1455,12 +1456,19 @@ fn regular_poles(patch: &Patch, tol: f64, frame: bool) -> Result<Patch> {
                     *q = Vec3::new(r.dot(x), r.dot(y), r.dot(z));
                 }
                 framed = true;
+                at_origin = true;
             }
         }
-        let pole = side
-            .iter()
-            .fold(Vec3::new(0.0, 0.0, 0.0), |a, &i| a + at(&e, i))
-            * (1.0 / n);
+        // (WR-759) the pole the frame was moved to is its origin, exactly: a rational side's
+        // homogeneous points (the pole times each weight) then vanish with it, as a
+        // polynomial side's derivatives do; the side's mean is that origin to round-off only
+        let pole = if at_origin {
+            Vec3::new(0.0, 0.0, 0.0)
+        } else {
+            side.iter()
+                .fold(Vec3::new(0.0, 0.0, 0.0), |a, &i| a + at(&e, i))
+                * (1.0 / n)
+        };
         for &i in side {
             if let Some(q) = e.get_mut(i) {
                 *q = pole;
