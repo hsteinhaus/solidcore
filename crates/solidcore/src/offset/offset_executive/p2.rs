@@ -1048,6 +1048,9 @@ impl OffsetExecutive {
             if kernel.fixes.offset_resolve_crossing_loops {
                 self.resolve_crossing_loops(kernel, original, notifications)?;
             }
+            // Not upstream (WR-762): an offset face whose loop holds a slit is the faces
+            // either side of it
+            self.remove_slits(kernel, original, notifications)?;
 
             let mut result = self.piecewise_merge(kernel, original, Some(&mut *notifications))?;
             // (WR-341: with the opt-in this also runs for a solid input whatever
