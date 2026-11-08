@@ -23,6 +23,8 @@ const PLATE: &[u8] =
     include_bytes!("../../solidcore/tests/data/issue_2364_solidcraft_5158_plate.smb");
 const NOTCHED: &[u8] =
     include_bytes!("../../solidcore/tests/data/issue_2364_solidcraft_1080_notched_block.smb");
+const KNOTEN: &[u8] =
+    include_bytes!("../../solidcore/tests/data/solidcraft_knoten_laminiert_fillet2.smb");
 
 /// SolidCraft's rig set at the time of the kernel's check: every fix but six.
 fn fixes() {
@@ -107,4 +109,38 @@ fn the_notched_block_s_second_rounds_meet_the_first() {
     assert_eq!(faces, 13, "13 as one blend; 15 with the smooth-vertex caps");
     assert!((v - 10_198.718_249_145).abs() <= 1e-9 * v, "{v}");
     assert_eq!(dropped, vec![false; 4]);
+}
+
+/// SolidCraft's Knoten_laminiert (Fillet2): a tube end's arc on a 0.5 mm plate rounded r 2
+/// with its tangent chain, as SolidCraft picks it: the arc, its two runs on over the tube's
+/// root round (Fillet1) and the two plate-top stubs on to the plate's corners. The stubs
+/// overflow on their own, the others do not; the stubs went first alone, each ending at a
+/// smooth vertex into a round of the second pass, which no End builds (status 1001). A round
+/// running on tangentially into another asked round goes first with it, so the chain is one
+/// blend: 25 + 5 faces and 33.238161 less, the kernel's one-pass build.
+#[test]
+fn a_tangent_chain_goes_first_as_one_blend() {
+    let at = [
+        [35.355_339_059_327_38, 35.355_339_059_327_37, 11.5],
+        [
+            43.833_499_645_125_82,
+            26.877_178_473_528_968,
+            0.960_399_282_160_999_2,
+        ],
+        [
+            26.877_178_473_528_94,
+            43.833_499_645_125_78,
+            0.960_399_282_160_999_9,
+        ],
+        [45.172_278_982_753_28, 25.538_399_135_901_47, 0.5],
+        [25.538_399_135_901_47, 45.172_278_982_753_26, 0.5],
+    ];
+    let (faces, v, dropped) = rounded(KNOTEN, &at, 2.0);
+    let v0 = Body::from_smb(KNOTEN.to_vec(), false)
+        .unwrap()
+        .volume(1e-8)
+        .unwrap();
+    assert_eq!(faces, 30, "5 faces as one blend");
+    assert!((v0 - v - 33.238_161).abs() <= 1e-6, "{}", v0 - v);
+    assert_eq!(dropped, vec![false; 5]);
 }
