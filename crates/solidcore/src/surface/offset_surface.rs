@@ -4284,4 +4284,43 @@ mod tests {
             "the tangent extension stays on the tube: {upstream}"
         );
     }
+
+    /// The offset of a sphere's pole (a regular pole: one tangent plane) is one point, the
+    /// pole moved by the distance along its normal, and the offset's side there is singular
+    /// as the sphere's is (WR-761): the evaluation takes the base's normal at the pole, not
+    /// a step-off extrapolation, which put the offset's pole points apart and its side's
+    /// derivative off zero.
+    #[test]
+    fn a_regular_poles_offset_is_one_point() {
+        use crate::surface::sphere::{Sphere, SphereOptions};
+        let k = Kernel::default();
+        let sphere = Sphere::new(
+            &k,
+            Vec3::ZERO,
+            Vec3::X,
+            Vec3::Y,
+            Extent2d::from_bounds(0.0, 0.0, 120.0, 90.0),
+            5.0,
+            SphereOptions::default(),
+        )
+        .unwrap();
+        let base = Surface::from(sphere);
+        let domain = base.natural_uv_domain_with_nurb(&k).unwrap();
+        let pole_v = domain.max().y;
+        let pole = base
+            .evaluate_point(&k, Point2::new(domain.min().x, pole_v))
+            .unwrap();
+        for d in [2.0, -2.0] {
+            let off =
+                Surface::from(OffsetSurface::new(&k, d, base.clone(), true, SS_UNKNOWN).unwrap());
+            let want = pole * ((5.0 + d) / 5.0);
+            for i in 0..=4 {
+                let u = domain.min().x + domain.x_length() * f64::from(i) / 4.0;
+                let p = off.evaluate_point(&k, Point2::new(u, pole_v)).unwrap();
+                assert!(p.distance(want) < 1e-12, "d {d} u {u}: {p:?} vs {want:?}");
+            }
+            let sides = off.get_singularities(&k, false, false).unwrap().singular;
+            assert_ne!(sides & SS_VMAX, 0, "d {d}: sides {sides:#x}");
+        }
+    }
 }
