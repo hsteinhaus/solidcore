@@ -878,6 +878,10 @@ pub struct ClassInputs {
     /// Whether the solver's radii can change along the edge (only the line, circle and
     /// point classes are kept then).
     pub radii_can_change: bool,
+    /// Not the fork (WR-757): the filleted edge's unit direction at its point nearest the
+    /// centre, which says which plane of a conic pair holds the round where the centre lies
+    /// on both (a node of the pair, [`pair_plane`]); `None` where it is not known.
+    pub along: Option<Vec3>,
 }
 
 /// Not the fork (#2405): the line two offsets of a line spine meet in, `O1 ∩ O2`, as its
@@ -1023,12 +1027,14 @@ fn inscribed_radius(q: &BlendQuadric, c: Point3) -> f64 {
 
 /// `sm_PairPlane`: two cylinders or cones (offsets) touching a common ball about `c` of
 /// radius `rho` the same way round: the plane of the conic of their intersection through
-/// `centre`, as a point and unit normal (`None` when neither is within `tol` of it).
+/// `centre`, as a point and unit normal (`None` when neither is within `tol` of it). Where
+/// both are (a node of the pair), the one the edge's direction `along` leaves least.
 fn pair_plane(
     q: &[BlendQuadric; 2],
     c: Point3,
     rho: f64,
     centre: Point3,
+    along: Option<Vec3>,
     tol: f64,
 ) -> Option<(Point3, Vec3)> {
     let mut u = [Vec3::ZERO; 2];
@@ -1045,6 +1051,8 @@ fn pair_plane(
     }
     let mut best = BIG_DOUBLE;
     let mut out = None;
+    // the planes holding the centre, each with how far the edge leaves it
+    let mut holding: Vec<(f64, (Point3, Vec3))> = Vec::new();
     for sign in [1.0, -1.0] {
         let n = u[1] * s[1] - u[0] * (sign * s[0]);
         let k = kk[1] * s[1] - kk[0] * sign * s[0];
@@ -1053,11 +1061,21 @@ fn pair_plane(
             continue;
         }
         let off = (n.dot(centre - c) - k).abs() / len;
+        let normal = n * (1.0 / len);
+        let plane = (c + normal * (k / len), normal);
+        if off <= tol {
+            holding.push((along.map_or(0.0, |t| normal.dot(t).abs()), plane));
+        }
         if off < best {
             best = off;
-            let normal = n * (1.0 / len);
-            out = Some((c + normal * (k / len), normal));
+            out = Some(plane);
         }
+    }
+    // Not the fork (WR-757): a centre on both planes (a node of the pair, where both conics
+    // pass) does not tell them apart; the round runs along its edge, which lies in its own
+    // plane: the one the edge leaves least
+    if let ([a, b], Some(_)) = (holding.as_slice(), along) {
+        return Some(if b.0 < a.0 { b.1 } else { a.1 });
     }
     if best <= tol {
         out
@@ -1310,7 +1328,10 @@ pub fn classify_blend_spine(centre: Point3, tol: f64, blend: &mut ExactBlend) {
             let rho_a = inscribed_radius(&a, c);
             let rho_b = inscribed_radius(&b, c);
             if rho_a > tol && (rho_a - rho_b).abs() <= tol {
-                if let Some((p, d)) = pair_plane(&[a, b], c, 0.5 * (rho_a + rho_b), centre, tol) {
+                let along = blend.inputs.and_then(|i| i.along);
+                if let Some((p, d)) =
+                    pair_plane(&[a, b], c, 0.5 * (rho_a + rho_b), centre, along, tol)
+                {
                     blend.point = p;
                     blend.dir = d;
                     blend.spine = BlendSpine::ConicPair;
@@ -1451,6 +1472,40 @@ pub fn classify_ball_on_collapsed_offset(centre: Point3, tol: f64, blend: &mut E
     blend.point = p;
 }
 
+/// The unit direction of edge `e` at its point nearest `p` (WR-757); `None` for an edge
+/// without curve, a point the solve does not find or a vanishing derivative.
+///
+/// # Errors
+///
+/// Those of the edge's interval; the solve's and the evaluation's unported or cancelled.
+fn edge_direction_nearest(k: &Kernel, b: &Brep, e: EdgeId, p: Point3) -> Result<Option<Vec3>> {
+    use crate::curve::curve::p1::GlobalPointSolveOptions;
+    use crate::geom::global_solver::{SolutionRequested, SolverOperation};
+    let Some(curve) = crate::topology::edge::curve(b, e)? else {
+        return Ok(None);
+    };
+    let ivl = crate::topology::edge::interval(b, e)?;
+    let Some(sols) = crate::error::ignored(curve.global_point_solve(
+        k,
+        &ivl,
+        SolverOperation::Minimize,
+        p,
+        EFF_ZERO_SQRT,
+        SolutionRequested::Single,
+        &GlobalPointSolveOptions::<crate::topology::ObjectHandle>::default(),
+    ))?
+    else {
+        return Ok(None);
+    };
+    let Some(t) = sols.get(0).and_then(|s| s.start.param(0).ok()) else {
+        return Ok(None);
+    };
+    let Some(pv) = crate::error::ignored(curve.evaluate(k, t, 1, true, false))? else {
+        return Ok(None);
+    };
+    Ok(pv.get(1).and_then(|d| d.unitize().ok()))
+}
+
 /// `SmFilletSolver::ClassifyExactBlend(rTsectPnt, rBlend)`: the exact class of the
 /// solver's constant round from its faces' kinds and placement at `tsect`. The faces are
 /// the offset surfaces' bases; each face's offset there is the ball's radius along its
@@ -1489,7 +1544,7 @@ pub fn classify_exact_blend(
         .solver()
         .edgeuse(0)?
         .ok_or_else(|| SolidError::null_pointer(OP))?;
-    eu::edge(b, eu0)?.ok_or_else(|| SolidError::null_pointer(OP))?;
+    let edge = eu::edge(b, eu0)?.ok_or_else(|| SolidError::null_pointer(OP))?;
     let tol = b.tolerance();
 
     let mut radius = 0.0;
@@ -1538,6 +1593,7 @@ pub fn classify_exact_blend(
         tol,
         ball_on_collapsed: !radii_can_change,
         radii_can_change,
+        along: edge_direction_nearest(k, b, edge, centre)?,
     };
     Ok(classify_faces(faces, &inputs))
 }
