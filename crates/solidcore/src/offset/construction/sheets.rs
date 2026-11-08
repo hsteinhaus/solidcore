@@ -1895,6 +1895,46 @@ mod tests {
         Nurb::new(net, 3, 3, knots.clone(), knots).unwrap()
     }
 
+    /// [`domed_quarter`] made rational with the weights `0.5^j` along v (column `j`): for a
+    /// Bezier patch a reparameterisation in v, the same dome. Its apex row is one point,
+    /// but its homogeneous points are the pole times weights that differ, as on a fillet's
+    /// conic-pair round that ends at a node (WR-759).
+    fn weighted_domed_quarter(tilted: bool) -> Nurb {
+        let s = domed_quarter(tilted);
+        let rows: Vec<Vec<CPoint>> = (0..4)
+            .map(|i| {
+                (0..4)
+                    .map(|j| {
+                        let p = s.cpt(i, j).unwrap();
+                        let w = 0.5f64.powi(j as i32);
+                        CPoint::new(p.x * w, p.y * w, p.z * w, w)
+                    })
+                    .collect()
+            })
+            .collect();
+        let knots = vec![0., 0., 0., 0., 1., 1., 1., 1.];
+        Nurb::new(rows, 3, 3, knots.clone(), knots).unwrap()
+    }
+
+    /// A rational pole is regular as the polynomial one is: its side is made one point at
+    /// the frame's origin exactly, so its homogeneous points (the pole times each weight)
+    /// vanish with it, the side's common factor divides out, and a thin wall either way
+    /// certifies. With the side's mean (round-off off the origin) instead, the forms do not
+    /// vanish there, and the wall was refused naming 0 (WR-759).
+    #[test]
+    fn weighted_domed_quarter_with_a_pole_certifies() {
+        for tilted in [false, true] {
+            let s = weighted_domed_quarter(tilted);
+            for d in [1.0, -1.0] {
+                assert_eq!(
+                    certify_regular(&Kernel::default(), &s, d, None).unwrap(),
+                    Regularity::Regular,
+                    "d {d} tilted {tilted}"
+                );
+            }
+        }
+    }
+
     /// The pole at the apex is regular: a thin wall either way certifies, and a wall past
     /// the radius folds on one side only, naming the radius (not 0 from the pole).
     #[test]
