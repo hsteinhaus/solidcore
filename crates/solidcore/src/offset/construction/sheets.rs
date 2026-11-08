@@ -384,11 +384,12 @@ fn offset_base(k: &Kernel, s: &Nurb, b: &Binomials) -> Result<OffsetBase> {
                 .collect::<Result<Vec<_>>>()
         })
         .collect::<Result<Vec<_>>>()?;
+    // (WR-759) the normals with each patch's pole at the origin exactly
     let normals = ps
         .iter()
         .map(|row| {
             row.iter()
-                .map(|p| pole_normal(p, b))
+                .map(|p| pole_normal(&regular_poles_at_origin(p, k.tolerances.zone_tol_3d)?, b))
                 .collect::<Result<Vec<_>>>()
         })
         .collect::<Result<Vec<_>>>()?;
@@ -1383,6 +1384,19 @@ pub fn proved_singular(
 /// frame's, gets the pole's normal coordinate exactly. `Q` is invariant under the move;
 /// the snaps stay within `tol`. Weights stay as they are.
 fn regular_poles(patch: &Patch, tol: f64, frame: bool) -> Result<Patch> {
+    regular_poles_moved(patch, tol, frame, false)
+}
+
+/// [`regular_poles`] moved (translated only, not turned) so its first pole is the origin
+/// exactly (WR-759): the patch's normal, invariant under the move, read there, where a
+/// rational pole's homogeneous points vanish exactly ([`pole_normal`]).
+fn regular_poles_at_origin(patch: &Patch, tol: f64) -> Result<Patch> {
+    regular_poles_moved(patch, tol, false, true)
+}
+
+/// [`regular_poles`], with `translate` (without `frame`) the patch moved so its first pole
+/// is the origin.
+fn regular_poles_moved(patch: &Patch, tol: f64, frame: bool, translate: bool) -> Result<Patch> {
     let [px, py, pz] = &patch.p;
     let (du, dv) = px.degrees();
     let width = dv + 1;
@@ -1412,6 +1426,7 @@ fn regular_poles(patch: &Patch, tol: f64, frame: bool) -> Result<Patch> {
     }
     let at = |e: &[Vec3], i: usize| e.get(i).copied().unwrap_or(Vec3::new(0.0, 0.0, 0.0));
     let mut framed = false;
+    let mut translated = false;
     // a line of control points within `tol` of its mean
     let collapsed = |e: &[Vec3], line: &[usize]| {
         let n = line.len().max(1) as f64;
@@ -1458,8 +1473,14 @@ fn regular_poles(patch: &Patch, tol: f64, frame: bool) -> Result<Patch> {
                 framed = true;
                 at_origin = true;
             }
+        } else if translate && !framed && !translated {
+            for q in &mut e {
+                *q = *q - pole;
+            }
+            translated = true;
+            at_origin = true;
         }
-        // (WR-759) the pole the frame was moved to is its origin, exactly: a rational side's
+        // (WR-759) the pole the frame (or translation) moved to is its origin, exactly: a rational side's
         // homogeneous points (the pole times each weight) then vanish with it, as a
         // polynomial side's derivatives do; the side's mean is that origin to round-off only
         let pole = if at_origin {
