@@ -1571,6 +1571,8 @@ impl OffsetExecutive {
                     .get_create_extended_surface(kernel, key.key.0, surface, margin)?
                     .clone();
                 let extension_domain = extension.natural_uv_domain_with_nurb(kernel)?;
+                // (WR-760) the face's UV trim curves, by the edge use holding each
+                let trims = held_uv_trim_curves(&temporary, id)?;
                 // cpp:1639: UNSURE retains the original; FALSE suppresses UV trim
                 // creation. The optional modified-face list is not requested.
                 let (original_surface, _) =
@@ -1594,6 +1596,16 @@ impl OffsetExecutive {
                             )
                         },
                     )??;
+                if let Some(replaced) = original_surface.as_ref() {
+                    restore_uv_trim_curves_on_extension(
+                        kernel,
+                        &mut temporary,
+                        id,
+                        replaced,
+                        &original_domain,
+                        trims,
+                    )?;
+                }
                 let trim_domain =
                     crate::topology::face::p1::calculate_uv_domain_from_uv_trim_curves(
                         kernel,
@@ -2388,6 +2400,91 @@ fn check_shell_radius(radius: f64, tolerance: f64) -> Result<()> {
 enum ExtendedDomainChoice {
     Original,
     Extension,
+}
+
+/// The UV trim curves of the edge uses of face `f`, each with the edge use holding it (one
+/// of a mated pair holds the pair's), each once.
+///
+/// # Errors
+///
+/// Those of the topology queries.
+fn held_uv_trim_curves(
+    b: &Brep,
+    f: FaceId,
+) -> Result<Vec<(EdgeuseId, crate::curve::curve::Curve)>> {
+    let mut out: Vec<(EdgeuseId, crate::curve::curve::Curve)> = Vec::new();
+    for lu in crate::topology::face::p4::upward_loopuses(b, f, false, None)? {
+        for e in eu::loopuse_edgeuses(b, lu)? {
+            let (curve, holder) = eu::uv_trim_curve(b, e)?;
+            if let (Some(curve), Some(holder)) = (curve, holder) {
+                if !out.iter().any(|(h, _)| *h == holder) {
+                    out.push((holder, curve.clone()));
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Not upstream (WR-760): after `ExtendResultFaces` put face `f` on its extended surface
+/// (which drops the face's UV trim curves), gives back the UV trim curves `trims` it had on
+/// `replaced`, where the extension is `replaced` over its domain `domain`: every trim
+/// curve lies in `domain`, and the extension and `replaced` agree at its points (sampled)
+/// within the face's tolerance. They are then the face's curves on the extension, exact,
+/// where dropping its edges' curves anew can go astray (at a pole, where every v of the
+/// collapsed side is the same point). Otherwise the face is left to the drop, as upstream.
+///
+/// # Errors
+///
+/// Those of the evaluations and of [`eu::set_uv_trim_curve`].
+fn restore_uv_trim_curves_on_extension(
+    k: &Kernel,
+    b: &mut Brep,
+    f: FaceId,
+    replaced: &crate::surface::surface::Surface,
+    domain: &Extent2d,
+    trims: Vec<(EdgeuseId, crate::curve::curve::Curve)>,
+) -> Result<()> {
+    if trims.is_empty() {
+        return Ok(());
+    }
+    let tol = crate::topology::face::p2::tolerance(b, f)?;
+    {
+        let extension = required(b.face(f)?.surface.as_ref(), OP_EXTENDED)?;
+        for (_, curve) in &trims {
+            let ivl = curve.natural_interval();
+            for i in 0..=8 {
+                let t = ivl.evaluate(f64::from(i) / 8.0);
+                let Some(p) = crate::error::ignored(curve.evaluate_point(k, t))? else {
+                    return Ok(());
+                };
+                let uv = crate::geom::vector2d::Point2::new(p.x, p.y);
+                if !domain.contains_point(uv, tol) {
+                    return Ok(());
+                }
+                let (Some(a), Some(c)) = (
+                    crate::error::ignored(replaced.evaluate_point(k, uv))?,
+                    crate::error::ignored(extension.evaluate_point(k, uv))?,
+                ) else {
+                    return Ok(());
+                };
+                if !(a.distance(c) <= tol) {
+                    return Ok(());
+                }
+            }
+        }
+    }
+    for (holder, curve) in trims {
+        eu::set_uv_trim_curve(
+            b,
+            holder,
+            eu::UvTrimCurveArg::New(Box::new(curve)),
+            0.0,
+            true,
+            None,
+        )?;
+    }
+    Ok(())
 }
 
 fn choose_extended_domain(
