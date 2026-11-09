@@ -1988,6 +1988,8 @@ impl FilletBrep {
                     } else {
                         None
                     };
+                    let tol_deg =
+                        crate::math::rad_to_deg(corners.corner(corner)?.tangency_tol_radians);
                     'next: for x in vertex::edges(target, far, None)? {
                         if x == side_edge || edge::is_closed(target, x)? {
                             continue;
@@ -2002,6 +2004,33 @@ impl FilletBrep {
                         else {
                             continue;
                         };
+                        // only onto a face the end face runs into tangentially (a flat
+                        // running onto a round): past a cliff the rail's end stays on the
+                        // continued surface (`fillet_rail_end_on_continued_surface`)
+                        let (Some(&end_face), Some(&next_face)) = (
+                            side_faces.iter().find(|&&f| f != rail_face),
+                            edge::faces(target, x, None)?
+                                .iter()
+                                .find(|&&f| f != rail_face),
+                        ) else {
+                            continue;
+                        };
+                        let mut tangent = false;
+                        for b in vertex::edges(target, far, None)? {
+                            let faces = edge::faces(target, b, None)?;
+                            if !faces.contains(&end_face) || !faces.contains(&next_face) {
+                                continue;
+                            }
+                            if let Some(&beu) = edge::edgeuses(target, b, None, None)?.first() {
+                                tangent = crate::blend::fillet_corner::topology::check_tangential_edgeuse_at_vertex(
+                                    k, target, beu, far, tol_deg,
+                                )?;
+                            }
+                            break;
+                        }
+                        if !tangent {
+                            continue;
+                        }
                         let on_rail_face = eu1::face(target, side_eu1)? == Some(rail_face);
                         for xe in edge::edgeuses(target, x, None, None)? {
                             // the next edge's use on the side the side edge use is on
