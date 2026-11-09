@@ -1338,6 +1338,35 @@ impl FilletBrep {
         // get filletEdge->vertices
         let (start_fv, end_fv) = self.edge_ends(e, OP_SIDE)?;
 
+        // Not upstream (WR-765): the vertex where an end rib split for a rolled rail end
+        // crosses the end face's edge with the next face is the fillet surface's crossing of
+        // that edge, once the surface exists
+        for fv in [start_fv, end_fv] {
+            let rec = self.fillet_vertex(fv)?;
+            if rec.is_processed()
+                || rec.fillet_vertex_type() != FilletVertexType::FilletXEdgeuse
+                || !matches!(
+                    rec.point_class_object(),
+                    Some(crate::error::EntityRef::Edgeuse(_))
+                )
+            {
+                continue;
+            }
+            let null = || SolidError::null_pointer(OP_SIDE);
+            let (prim, _) = self.p5_prim_mate(e, OP_SIDE)?;
+            let g = self.eu_geom(prim)?.ok_or_else(null)?;
+            let surface = self
+                .geom(g)?
+                .fillet_surface(None)?
+                .map(exact_surface)
+                .transpose()?
+                .ok_or_else(null)?;
+            let tol = context
+                .solver(self.geom(g)?.fillet_solver().ok_or_else(null)?)?
+                .approx_tol_3d;
+            self.calc_fillet_int_edgeuse_near(k, fv, target, &surface, tol)?;
+        }
+
         // check state - both vertices must be processed
         if !self.fillet_vertex(start_fv)?.is_processed()
             || !self.fillet_vertex(end_fv)?.is_processed()

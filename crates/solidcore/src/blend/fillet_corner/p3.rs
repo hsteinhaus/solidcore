@@ -2218,6 +2218,162 @@ impl FilletCorner {
     }
 }
 
+impl FilletCorner {
+    /// Not upstream (WR-765): at an `NByOne` corner, a rail that ran past the far end of its
+    /// side edge onto the next edge (`calc_rail_int_edgeuse`) ends on the next face, past
+    /// the end face's edge with it. The end rib is split there: from the other rail's end
+    /// on the end face to a new vertex on that edge (the fillet surface's crossing of it,
+    /// calculated with the rib), then on the next face to the rail's end, so the end face
+    /// and the next face each hold their part of the round's end.
+    ///
+    /// # Errors
+    /// Dangling ids; those of the pseudo-topology edits.
+    pub fn adjust_rolled_rail_ends(
+        &mut self,
+        k: &Kernel,
+        target: &Brep,
+        pseudo: &mut FilletBrep,
+        this_id: Option<FilletCornerId>,
+    ) -> Result<()> {
+        use crate::topology::vertex;
+        if self.kind != FilletCornerKind::NByOne {
+            return Ok(());
+        }
+        let Some(corner_vertex) = self.vertex else {
+            return Ok(());
+        };
+        for v in self.vertices.clone() {
+            let fv = pseudo.fillet_vertex(v)?;
+            if fv.fillet_vertex_type() != FilletVertexType::RailXEdgeuse {
+                continue;
+            }
+            let Some(EntityRef::Edgeuse(xe)) = fv.point_class_object() else {
+                continue;
+            };
+            let Some(x) = eu1::edge(target, xe)? else {
+                continue;
+            };
+            let x_ends = [edge::start_vertex(target, x)?, edge::end_vertex(target, x)?];
+            if x_ends.contains(&Some(corner_vertex)) {
+                continue;
+            }
+            // the side edge it ran past, and its far vertex (where the next edge starts)
+            let mut past = None;
+            for &eu in self.all_eus.as_deref().unwrap_or_default() {
+                let Some(se) = eu1::edge(target, eu)? else {
+                    continue;
+                };
+                let (ss, st) = (
+                    edge::start_vertex(target, se)?,
+                    edge::end_vertex(target, se)?,
+                );
+                let far = if ss == Some(corner_vertex) {
+                    st
+                } else if st == Some(corner_vertex) {
+                    ss
+                } else {
+                    None
+                };
+                if far.is_some() && x_ends.contains(&far) {
+                    past = far.map(|far| (se, far));
+                    break;
+                }
+            }
+            let Some((side_edge, far)) = past else {
+                continue;
+            };
+            let side_faces = edge::faces(target, side_edge, None)?;
+            let x_faces = edge::faces(target, x, None)?;
+            let Some(&rail_face) = x_faces.iter().find(|f| side_faces.contains(f)) else {
+                continue;
+            };
+            let (Some(&end_face), Some(&next_face)) = (
+                side_faces.iter().find(|&&f| f != rail_face),
+                x_faces.iter().find(|&&f| f != rail_face),
+            ) else {
+                continue;
+            };
+            // the end face's edge with the next face at the far vertex
+            let mut boundary = None;
+            for e in vertex::edges(target, far, None)? {
+                let faces = edge::faces(target, e, None)?;
+                if faces.contains(&end_face) && faces.contains(&next_face) {
+                    boundary = Some(e);
+                    break;
+                }
+            }
+            let Some(boundary) = boundary else {
+                continue;
+            };
+            let mut boundary_eu = None;
+            for u in edge::edgeuses(target, boundary, None, None)? {
+                if eu1::face(target, u)? == Some(end_face) {
+                    boundary_eu = Some(u);
+                    break;
+                }
+            }
+            let Some(boundary_eu) = boundary_eu else {
+                continue;
+            };
+            // the end rib through the rail's end
+            let mut rib = None;
+            for (i, &e) in self.edges.iter().enumerate() {
+                if pseudo.fillet_edge(e)?.fillet_edge_type() != FilletEdgeType::FilletXSideFace {
+                    continue;
+                }
+                let ends = [
+                    edge::start_vertex(pseudo.brep(), e)?,
+                    edge::end_vertex(pseudo.brep(), e)?,
+                ];
+                if ends.contains(&Some(v)) {
+                    rib = Some((i, e, ends));
+                    break;
+                }
+            }
+            let Some((index, rib, [Some(a), Some(b)])) = rib else {
+                continue;
+            };
+            let geom = pseudo
+                .fillet_edgeuse(primary_eu(pseudo, rib, OP_TOPO)?)?
+                .fillet_geom();
+
+            // the vertex where the rib crosses the end face's edge with the next face
+            let crossing = pseudo.brep_mut().add_vertex(target.vertex(far)?.point)?;
+            let mut fv = FilletVertex::new(k, this_id);
+            fv.set_point_class(
+                PointClassType::Edgeuse,
+                Some(EntityRef::Edgeuse(boundary_eu)),
+            );
+            fv.set_fillet_vertex_type(FilletVertexType::FilletXEdgeuse);
+            pseudo.insert_fillet_vertex(crossing, fv);
+            self.vertices.push(crossing);
+
+            let mut parts = Vec::with_capacity(2);
+            for (from, to) in [(a, crossing), (crossing, b)] {
+                let face = if from == v || to == v {
+                    next_face
+                } else {
+                    end_face
+                };
+                let part = pseudo.make_fillet_edge(Some(from), Some(to), this_id)?;
+                pseudo
+                    .fillet_edge_mut(part)?
+                    .set_fillet_edge_type(FilletEdgeType::FilletXSideFace);
+                let prim = primary_eu(pseudo, part, OP_TOPO)?;
+                pseudo.set_edgeuse_fillet_geom(prim, geom)?;
+                pseudo.fillet_edge_mut(part)?.set_original_face(Some(face));
+                parts.push(part);
+            }
+            self.edges.remove(index);
+            pseudo.delete_fillet_edge(rib)?;
+            for (j, part) in parts.into_iter().enumerate() {
+                self.edges.insert(index + j, part);
+            }
+        }
+        Ok(())
+    }
+}
+
 /// An evaluation whose status upstream ignores (`EvaluatePoint` without `SER`): a
 /// failure leaves the default-constructed point ([`Point3::UNDEF`]); an unported
 /// evaluator still propagates.

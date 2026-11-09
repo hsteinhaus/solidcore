@@ -1821,7 +1821,7 @@ impl FilletBrep {
         let vu1 = self.vu_at_rail_end(v, Some(first), None, None)?;
 
         // Set dGuessEdgeParameters to run from one edgeEnd to the other
-        let side_eu1 = side_eu1.ok_or_else(|| SolidError::null_pointer(OP))?;
+        let mut side_eu1 = side_eu1.ok_or_else(|| SolidError::null_pointer(OP))?;
         let side_edge = eu1::edge(target, side_eu1)?.ok_or_else(|| SolidError::null_pointer(OP))?;
         let ivl = edge::interval(target, side_edge)?;
 
@@ -2003,6 +2003,116 @@ impl FilletBrep {
                         Some(far),
                         depth + 1,
                     );
+                }
+            }
+
+            // Not upstream (WR-765): a rail found meeting the side edge's line past the edge's
+            // far end (on the base surface continued, `fillet_rail_end_on_continued_surface`)
+            // runs past the face the side edge bounds there onto the next one: where it meets
+            // the next edge on its face at that vertex, within that edge, it ends there (as a
+            // rail past a seam does above), on the face it runs onto, not on the line's
+            // continuation, which the next face leaves.
+            if found && !is_closed {
+                let far = if from_start {
+                    edge::end_vertex(target, side_edge)?
+                } else {
+                    edge::start_vertex(target, side_edge)?
+                };
+                let far_param = ivl.evaluate(if from_start { 1.0 } else { 0.0 });
+                let past = if from_start {
+                    edgeuse_parameter > far_param
+                } else {
+                    edgeuse_parameter < far_param
+                };
+                if let (Some(far), true) = (far, past && ivl.distance_from(edgeuse_parameter) > 0.0)
+                {
+                    let temp_si = if corners.corner(corner)?.is_calc_as_const_rad() {
+                        Some(RailSolvers::geom_solver(self, g1)?)
+                    } else {
+                        None
+                    };
+                    let tol_deg =
+                        crate::math::rad_to_deg(corners.corner(corner)?.tangency_tol_radians);
+                    'next: for x in vertex::edges(target, far, None)? {
+                        if x == side_edge || edge::is_closed(target, x)? {
+                            continue;
+                        }
+                        let x_ivl = edge::interval(target, x)?;
+                        let x_from_start = edge::start_vertex(target, x)? == Some(far);
+                        // the face the rail runs on: the one the two edges share
+                        let side_faces = edge::faces(target, side_edge, None)?;
+                        let Some(rail_face) = edge::faces(target, x, None)?
+                            .into_iter()
+                            .find(|f| side_faces.contains(f))
+                        else {
+                            continue;
+                        };
+                        // only onto a face the end face runs into tangentially (a flat
+                        // running onto a round): past a cliff the rail's end stays on the
+                        // continued surface (`fillet_rail_end_on_continued_surface`)
+                        let (Some(&end_face), Some(&next_face)) = (
+                            side_faces.iter().find(|&&f| f != rail_face),
+                            edge::faces(target, x, None)?
+                                .iter()
+                                .find(|&&f| f != rail_face),
+                        ) else {
+                            continue;
+                        };
+                        let mut tangent = false;
+                        for b in vertex::edges(target, far, None)? {
+                            let faces = edge::faces(target, b, None)?;
+                            if !faces.contains(&end_face) || !faces.contains(&next_face) {
+                                continue;
+                            }
+                            if let Some(&beu) = edge::edgeuses(target, b, None, None)?.first() {
+                                tangent = crate::blend::fillet_corner::topology::check_tangential_edgeuse_at_vertex(
+                                    k, target, beu, far, tol_deg,
+                                )?;
+                            }
+                            break;
+                        }
+                        if !tangent {
+                            continue;
+                        }
+                        let on_rail_face = eu1::face(target, side_eu1)? == Some(rail_face);
+                        for xe in edge::edgeuses(target, x, None, None)? {
+                            // the next edge's use on the side the side edge use is on
+                            if (eu1::face(target, xe)? == Some(rail_face)) != on_rail_face {
+                                continue;
+                            }
+                            let Ok(index) =
+                                self.rail_index_of_side_eu_resolved(g1, xe, target, &|id| {
+                                    solvers.solver(id)
+                                })
+                            else {
+                                continue;
+                            };
+                            if index != rail_index {
+                                continue;
+                            }
+                            for f in [0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.99] {
+                                let guess = x_ivl.evaluate(if x_from_start { f } else { 1.0 - f });
+                                let mut tsect = tsect1.clone();
+                                let r = rail_edgeuse_intersect(
+                                    self, k, g1, solvers, target, temp_si, rail_index, xe, guess,
+                                    &mut tsect,
+                                );
+                                if let Ok(Some(p)) = r {
+                                    if x_ivl.distance_from(p) == 0.0 {
+                                        side_eu1 = xe;
+                                        edgeuse_parameter = p;
+                                        tsect1 = tsect;
+                                        self.fillet_vertexuse_mut(vu1)?.set_tsect_pnt(&tsect1);
+                                        self.fillet_vertex_mut(v)?.set_point_class(
+                                            crate::intersect::point_class::PointClassType::Edgeuse,
+                                            Some(EntityRef::Edgeuse(xe)),
+                                        );
+                                        break 'next;
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
 

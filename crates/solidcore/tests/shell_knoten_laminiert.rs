@@ -16,7 +16,7 @@ use solidcore::offset::offset_executive::p2::{shell_brep_simple, OffsetOptions, 
 use solidcore::topology::api_files::read_brep_from_file;
 use solidcore::topology::brep::{p1, p10::TopologyEnv};
 use solidcore::topology::topology::NotifyRecords;
-use solidcore::topology::Brep;
+use solidcore::topology::{edge, vertex, Brep, EdgeId};
 use solidcore::{EntityRef, Kernel, SolidError};
 
 const BODY: &[u8] = include_bytes!("data/solidcraft_knoten_laminiert_shell1.smb");
@@ -97,4 +97,47 @@ fn shell1_is_fusions() {
     };
     let volume = brep_volume(&Kernel::default(), &mut out, 1e-8, &attrs).unwrap();
     assert!((volume - 4603.714).abs() < 1e-3, "{volume}");
+}
+
+/// Fillet4 after Shell1 as Fusion's: the plate's 8 outline corners at the arm ends rounded r 3
+/// (their rails run 0.009 past the plate's side edges onto Fillet2's rounds, WR-765): 64
+/// faces, a valid body, the rails' ends on those rounds where Fusion has them.
+#[test]
+fn fillet4_is_fusions() {
+    use solidcore::blend::fillet_executive::api::fillet_edges;
+    use solidcore::geom::vector3d::Point3;
+    use solidcore::topology::brep::validation::{check_brep, CheckLevel};
+    let mut b = shell1().unwrap();
+    let mut k = Kernel::default();
+    k.fixes = UpstreamFixes::all();
+    k.fixes.fillet_refuse_rounds_breaking_through = false;
+    k.fixes.fillet_round_ends_on_outline = false;
+    let corner = |s: Point3| {
+        (s.x.abs() - 45.608).abs() < 1e-2 && (s.y.abs() - 25.102).abs() < 1e-2
+            || (s.y.abs() - 45.608).abs() < 1e-2 && (s.x.abs() - 25.102).abs() < 1e-2
+    };
+    let edges: Vec<EdgeId> = p1::edges(&b, None)
+        .unwrap()
+        .into_iter()
+        .filter(|&e| {
+            let s = vertex::point(&b, edge::start_vertex(&b, e).unwrap().unwrap()).unwrap();
+            let t = vertex::point(&b, edge::end_vertex(&b, e).unwrap().unwrap()).unwrap();
+            (s.x - t.x).abs() < 1e-6
+                && (s.y - t.y).abs() < 1e-6
+                && (s.z - t.z).abs() > 0.4
+                && corner(s)
+        })
+        .collect();
+    assert_eq!(edges.len(), 8);
+    fillet_edges(&mut k, &mut b, &edges, 3.0, 1, 1, 1.0).unwrap();
+    let check = check_brep(&mut k, &mut b, CheckLevel::Level2).unwrap();
+    assert!(check.is_valid(), "{:?}", check.lines());
+    assert_eq!(p1::faces(&b, None).unwrap().len(), 64);
+    let fusion = Point3::new(44.72971, 25.98097, 0.50002);
+    let near = p1::vertices(&b, None)
+        .unwrap()
+        .into_iter()
+        .map(|v| vertex::point(&b, v).unwrap().distance(fusion))
+        .fold(f64::INFINITY, f64::min);
+    assert!(near < 1e-5, "{near}");
 }
