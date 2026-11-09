@@ -43,7 +43,9 @@
 //!   `MakeVertexSplitEdge` (through [`super::p1::test_and_split_edge`]) defer only where their own
 //!   units still do.
 
-use super::p1::{sort_by_param, AdvancedStitch, DefaultStitchCallback, SplitReason, Stitch};
+use super::p1::{
+    sort_by_param, AdvancedStitch, DefaultStitchCallback, KeepChoice, SplitReason, Stitch,
+};
 use crate::curve::curve::Curve;
 use crate::error::{ignore_status, ignored, EntityRef, SM_ERR};
 use crate::geom::extent3d::Extent3d;
@@ -205,6 +207,25 @@ pub struct SplitEdges {
     pub max_vertex_gap: f64,
     /// Smallest gap of a vertex too far from an edge (`rdMinUnstitchedVertGap`).
     pub min_unstitched_vert_gap: f64,
+}
+
+/// What [`Stitch::edge_pair_gap`] finds of an edge pair sharing both vertices.
+#[derive(Debug, Clone, Copy)]
+enum EdgePairGap {
+    /// They coincide: glue them, the second's curve running as `orientation`, `distance`
+    /// apart, keeping as `choice` says.
+    Glue {
+        orientation: OrientType,
+        distance: f64,
+        choice: KeepChoice,
+    },
+    /// Not glued; the gap measured that kept them apart, where one was, and the curves'
+    /// distance where they were within tolerance but the callback's choice kept them apart
+    /// (`DoStitching` counts it in its largest edge gap all the same).
+    Apart {
+        gap: Option<f64>,
+        measured: Option<f64>,
+    },
 }
 
 impl Stitch<'_> {
@@ -727,134 +748,39 @@ impl Stitch<'_> {
                         continue;
                     }
 
-                    let e_ivl = edge::interval(b, e)?;
-                    let te_ivl = edge::interval(b, test_e)?;
-                    let e_curve = curve_of(b, e)?;
-                    let te_curve = curve_of(b, test_e)?;
-
-                    // select new tolerance
-                    let this_tol =
-                        smos_max(tol_3d, edge::tolerance(b, test_e)? + edge::tolerance(b, e)?);
-
-                    let mid_pnt = e_curve.evaluate_point(k, e_ivl.evaluate(0.5))?;
-
-                    // If we're finding pdMinUnstitchedEdgeGap, collect every solution.
-                    let guess = te_ivl.mid();
-                    let drop_tol = if out.min_unstitched_edge_gap.is_none() {
-                        this_tol
-                    } else {
-                        BIG_DOUBLE
-                    };
-
-                    // skip edge pair if pE->midPoint is not within tolerance of pTestE
-                    let dropped = match te_curve.drop_point(
+                    let (orientation, dist_to_curve, choice) = match self.edge_pair_gap(
                         k,
-                        &te_ivl,
-                        mid_pnt,
-                        None,
-                        drop_tol,
-                        Some(guess),
-                        SolverOperation::Minimize,
-                    ) {
-                        Ok(d) if d.success => d,
-                        Err(err) if err.is_unported_or_cancelled() => return Err(err),
-                        // no drop point, or a failing status
-                        Ok(_) | Err(_) => continue,
-                    };
-                    let mut dist_to_curve = dropped.distance;
-
-                    if dist_to_curve > this_tol {
-                        if let Some(min_gap) = out.min_unstitched_edge_gap.as_mut() {
-                            if dist_to_curve < *min_gap {
-                                *min_gap = dist_to_curve;
+                        b,
+                        e,
+                        test_e,
+                        tol_3d,
+                        out.min_unstitched_edge_gap.is_some(),
+                    )? {
+                        EdgePairGap::Glue {
+                            orientation,
+                            distance,
+                            choice,
+                        } => (orientation, distance, choice),
+                        EdgePairGap::Apart { gap, measured } => {
+                            if let Some(d) = measured {
+                                if d > out.max_edge_gap {
+                                    out.max_edge_gap = d;
+                                }
                             }
-                        }
-                        continue;
-                    }
-
-                    // Check relative orientation of the edge curves.
-                    let pv = e_curve.evaluate(k, e_ivl.evaluate(0.5), 1, true, true)?;
-                    let pv_test = te_curve.evaluate(k, dropped.parameter, 1, true, true)?;
-
-                    let mut orientation = OrientType::Same;
-                    let mut t_start = te_ivl.min();
-                    let mut t_end = te_ivl.max();
-                    if tangent(&pv)?.dot(tangent(&pv_test)?) < 0.0 {
-                        orientation = OrientType::Opposite;
-                        core::mem::swap(&mut t_start, &mut t_end);
-                    }
-
-                    // skip edge pairs not within tolerance of one another
-                    let edges_are_lines = (e_curve.degree()? == 1
-                        && e_curve.number_natural_knots(k)? == 4)
-                        && (te_curve.degree()? == 1 && te_curve.number_natural_knots(k)? == 4);
-                    dist_to_curve = 0.0;
-                    if !edges_are_lines {
-                        // do a quick 5 point distance check
-                        dist_to_curve = e_curve
-                            .curve_max_distance_between(
-                                k,
-                                &e_ivl,
-                                te_curve,
-                                t_start,
-                                t_end,
-                                5,
-                                Some(this_tol),
-                            )?
-                            .distance;
-                        if dist_to_curve > this_tol {
-                            if let Some(min_gap) = out.min_unstitched_edge_gap.as_mut() {
-                                if dist_to_curve < *min_gap {
-                                    *min_gap = dist_to_curve;
+                            if let (Some(min_gap), Some(gap)) =
+                                (out.min_unstitched_edge_gap.as_mut(), gap)
+                            {
+                                if gap < *min_gap {
+                                    *min_gap = gap;
                                 }
                             }
                             continue;
                         }
-
-                        // when asked - do a precise distance check
-                        if !self.fast_edge_compare {
-                            dist_to_curve = e_curve
-                                .curve_max_distance_between(
-                                    k,
-                                    &e_ivl,
-                                    te_curve,
-                                    t_start,
-                                    t_end,
-                                    0,
-                                    Some(this_tol),
-                                )?
-                                .distance;
-                            if dist_to_curve > this_tol {
-                                if let Some(min_gap) = out.min_unstitched_edge_gap.as_mut() {
-                                    if dist_to_curve < *min_gap {
-                                        *min_gap = dist_to_curve;
-                                    }
-                                }
-                                continue;
-                            }
-                        }
-                    }
+                    };
 
                     // If make it here then we need to glue edges; save the maxEdgeGap
                     if dist_to_curve > out.max_edge_gap {
                         out.max_edge_gap = dist_to_curve;
-                    }
-
-                    // skip edges farther apart than the dMaxDistance
-                    let choice = self.callback().select_topology_to_keep(
-                        k,
-                        b,
-                        EntityRef::Edge(e),
-                        EntityRef::Edge(test_e),
-                        this_tol,
-                    )?;
-                    if choice.max_distance > this_tol {
-                        if let Some(min_gap) = out.min_unstitched_edge_gap.as_mut() {
-                            if choice.max_distance < *min_gap {
-                                *min_gap = choice.max_distance;
-                            }
-                        }
-                        continue;
                     }
 
                     // branch on which edge to keep
@@ -918,6 +844,176 @@ impl Stitch<'_> {
             }
         }
         Ok(())
+    }
+
+    /// `DoStitching`'s test of an edge pair sharing both vertices (the edge loop's body,
+    /// unchanged): `test_e`'s point nearest `e`'s middle within `max(tol_3d, the two edge
+    /// tolerances)`, the curves' relative orientation, their largest distance (five
+    /// points, then precisely unless [`Stitch::fast_edge_compare`]) and the callback's
+    /// choice of the edge to keep within that tolerance. [`EdgePairGap::Apart`] carries
+    /// the gap that kept them apart where one was measured. `collect_gaps` drops the
+    /// middle point at any distance, as when the smallest unstitched gap is asked for.
+    ///
+    /// # Errors
+    ///
+    /// Those of the evaluations, distance measures and the callback.
+    #[allow(clippy::too_many_lines)] // one upstream loop body
+    fn edge_pair_gap(
+        &mut self,
+        k: &mut Kernel,
+        b: &mut Brep,
+        e: EdgeId,
+        test_e: EdgeId,
+        tol_3d: f64,
+        collect_gaps: bool,
+    ) -> Result<EdgePairGap> {
+        let e_ivl = edge::interval(b, e)?;
+        let te_ivl = edge::interval(b, test_e)?;
+        let e_curve = curve_of(b, e)?;
+        let te_curve = curve_of(b, test_e)?;
+
+        // select new tolerance
+        let this_tol = smos_max(tol_3d, edge::tolerance(b, test_e)? + edge::tolerance(b, e)?);
+
+        let mid_pnt = e_curve.evaluate_point(k, e_ivl.evaluate(0.5))?;
+
+        // If we're finding pdMinUnstitchedEdgeGap, collect every solution.
+        let guess = te_ivl.mid();
+        let drop_tol = if !collect_gaps { this_tol } else { BIG_DOUBLE };
+
+        // skip edge pair if pE->midPoint is not within tolerance of pTestE
+        let dropped = match te_curve.drop_point(
+            k,
+            &te_ivl,
+            mid_pnt,
+            None,
+            drop_tol,
+            Some(guess),
+            SolverOperation::Minimize,
+        ) {
+            Ok(d) if d.success => d,
+            Err(err) if err.is_unported_or_cancelled() => return Err(err),
+            // no drop point, or a failing status
+            Ok(_) | Err(_) => {
+                return Ok(EdgePairGap::Apart {
+                    gap: None,
+                    measured: None,
+                })
+            }
+        };
+        let mut dist_to_curve = dropped.distance;
+
+        if dist_to_curve > this_tol {
+            return Ok(EdgePairGap::Apart {
+                gap: Some(dist_to_curve),
+                measured: None,
+            });
+        }
+
+        // Check relative orientation of the edge curves.
+        let pv = e_curve.evaluate(k, e_ivl.evaluate(0.5), 1, true, true)?;
+        let pv_test = te_curve.evaluate(k, dropped.parameter, 1, true, true)?;
+
+        let mut orientation = OrientType::Same;
+        let mut t_start = te_ivl.min();
+        let mut t_end = te_ivl.max();
+        if tangent(&pv)?.dot(tangent(&pv_test)?) < 0.0 {
+            orientation = OrientType::Opposite;
+            core::mem::swap(&mut t_start, &mut t_end);
+        }
+
+        // skip edge pairs not within tolerance of one another
+        let edges_are_lines = (e_curve.degree()? == 1 && e_curve.number_natural_knots(k)? == 4)
+            && (te_curve.degree()? == 1 && te_curve.number_natural_knots(k)? == 4);
+        dist_to_curve = 0.0;
+        if !edges_are_lines {
+            // do a quick 5 point distance check
+            dist_to_curve = e_curve
+                .curve_max_distance_between(k, &e_ivl, te_curve, t_start, t_end, 5, Some(this_tol))?
+                .distance;
+            if dist_to_curve > this_tol {
+                return Ok(EdgePairGap::Apart {
+                    gap: Some(dist_to_curve),
+                    measured: None,
+                });
+            }
+
+            // when asked - do a precise distance check
+            if !self.fast_edge_compare {
+                dist_to_curve = e_curve
+                    .curve_max_distance_between(
+                        k,
+                        &e_ivl,
+                        te_curve,
+                        t_start,
+                        t_end,
+                        0,
+                        Some(this_tol),
+                    )?
+                    .distance;
+                if dist_to_curve > this_tol {
+                    return Ok(EdgePairGap::Apart {
+                        gap: Some(dist_to_curve),
+                        measured: None,
+                    });
+                }
+            }
+        }
+
+        // skip edges farther apart than the dMaxDistance
+        let choice = self.callback().select_topology_to_keep(
+            k,
+            b,
+            EntityRef::Edge(e),
+            EntityRef::Edge(test_e),
+            this_tol,
+        )?;
+        if choice.max_distance > this_tol {
+            return Ok(EdgePairGap::Apart {
+                gap: Some(choice.max_distance),
+                measured: Some(dist_to_curve),
+            });
+        }
+        Ok(EdgePairGap::Glue {
+            orientation,
+            distance: dist_to_curve,
+            choice,
+        })
+    }
+
+    /// Whether vertices `v` and `w` are one point as `DoStitching` finds vertices to glue:
+    /// nearer than `max(stitch tolerance, the two vertex tolerances)`.
+    ///
+    /// # Errors
+    ///
+    /// Those of the vertex reads.
+    pub fn vertices_coincide(&self, b: &Brep, v: VertexId, w: VertexId) -> Result<bool> {
+        let test_tol = smos_max(
+            self.stitch_tol_3d(),
+            vertex::tolerance(b, w)? + vertex::tolerance(b, v)?,
+        );
+        Ok(vertex::point(b, v)?.distance(vertex::point(b, w)?) < test_tol)
+    }
+
+    /// Whether edges `e` and `test_e`, sharing both their vertices, coincide as
+    /// `DoStitching` finds pairs to glue ([`Stitch::edge_pair_gap`] at the stitch
+    /// tolerance).
+    ///
+    /// # Errors
+    ///
+    /// Those of [`Stitch::edge_pair_gap`].
+    pub fn edges_coincide(
+        &mut self,
+        k: &mut Kernel,
+        b: &mut Brep,
+        e: EdgeId,
+        test_e: EdgeId,
+    ) -> Result<bool> {
+        let tol_3d = self.stitch_tol_3d();
+        Ok(matches!(
+            self.edge_pair_gap(k, b, e, test_e, tol_3d, false)?,
+            EdgePairGap::Glue { .. }
+        ))
     }
 
     /// `StitchVertexPairs` (one-list overload): glues (or, with
