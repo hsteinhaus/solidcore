@@ -71,3 +71,58 @@ fn a_rail_past_its_side_edge_ends_on_the_next_one() {
         .fold(f64::INFINITY, f64::min);
     assert!(near < 1e-6, "{near}");
 }
+
+/// Where the round's end crosses the plate's top edge with the r 2 round, 6.2e-6 from that
+/// edge's end (both corners, the stitch gluing the round's vertex to the edge's end from either
+/// side): the vertex is the crossing, on the round, the plate's top and the r 2 round, as Fusion
+/// has it, not the edge's old end (the vertices lie within each other's tolerance).
+#[test]
+fn the_rounds_end_crosses_the_seam_where_it_lies() {
+    let mut k = Kernel::default();
+    k.fixes = UpstreamFixes::all();
+    k.fixes.fillet_refuse_rounds_breaking_through = false;
+    k.fixes.fillet_round_ends_on_outline = false;
+    let plate = create_box(&mut k, Point3::new(0.0, 0.0, 0.0), 30.0, 20.0, 1.0).unwrap();
+    let wall = create_box(&mut k, Point3::new(10.0, 0.0, 0.0), 20.0, 20.0, 6.0).unwrap();
+    let mut b = boolean_union(&mut k, plate, wall).unwrap();
+    let valley = edge_between(
+        &b,
+        Point3::new(10.0, 0.0, 1.0),
+        Point3::new(10.0, 20.0, 1.0),
+    );
+    fillet_edges(&mut k, &mut b, &[valley], 2.0, 1, 1, 1.0).unwrap();
+    let r = 8.01;
+    let corners = [
+        edge_between(&b, Point3::new(0.0, 0.0, 0.0), Point3::new(0.0, 0.0, 1.0)),
+        edge_between(&b, Point3::new(0.0, 20.0, 0.0), Point3::new(0.0, 20.0, 1.0)),
+    ];
+    fillet_edges(&mut k, &mut b, &corners, r, 1, 1, 1.0).unwrap();
+    let check = check_brep(&mut k, &mut b, CheckLevel::Level2).unwrap();
+    assert!(check.is_valid(), "{:?}", check.lines());
+    let points: Vec<Point3> = p1::vertices(&b, None)
+        .unwrap()
+        .into_iter()
+        .map(|v| vertex::point(&b, v).unwrap())
+        .collect();
+    let nearest = |p: Point3| {
+        points
+            .iter()
+            .map(|q| q.distance(p))
+            .fold(f64::INFINITY, f64::min)
+    };
+    let dy = r - (r * r - (r - 8.0) * (r - 8.0)).sqrt();
+    for (crossing, old_end) in [
+        (Point3::new(8.0, dy, 1.0), Point3::new(8.0, 0.0, 1.0)),
+        (
+            Point3::new(8.0, 20.0 - dy, 1.0),
+            Point3::new(8.0, 20.0, 1.0),
+        ),
+    ] {
+        assert!(
+            nearest(crossing) < 1e-9,
+            "{crossing:?}: {}",
+            nearest(crossing)
+        );
+        assert!(nearest(old_end) > 1e-9, "{old_end:?}: {}", nearest(old_end));
+    }
+}
