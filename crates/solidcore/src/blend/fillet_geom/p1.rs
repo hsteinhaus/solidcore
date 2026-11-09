@@ -1926,6 +1926,71 @@ impl FilletBrep {
         Ok(())
     }
 
+    /// Not upstream (WR-765): places fillet vertex `v` (classified on a target edge use) at
+    /// the fillet surface's crossing of that edge within the edge, the crossing nearest the
+    /// vertex's point now (`calc_cliff_rail_int_edge`'s, which takes the first). The end
+    /// rib's vertex on the end face's edge with the face a rolled rail ends on
+    /// (`FilletCorner::adjust_rolled_rail_ends`).
+    ///
+    /// # Errors
+    /// As [`Self::calc_cliff_rail_int_edge`]; `SM_ERR` without a crossing.
+    pub fn calc_fillet_int_edgeuse_near(
+        &mut self,
+        k: &Kernel,
+        v: VertexId,
+        target: &Brep,
+        fillet_surface: &Surface,
+        this_approx_tol_3d: f64,
+    ) -> Result<()> {
+        let eu = match self.fillet_vertex(v)?.point_class_object() {
+            Some(EntityRef::Edgeuse(eu)) => eu,
+            Some(_) => {
+                return Err(SolidError::invalid_input(
+                    OP_CLIFF,
+                    "classification object is not an edge use",
+                ))
+            }
+            None => return Err(SolidError::null_pointer(OP_CLIFF)),
+        };
+        let edge = target
+            .edgeuse(eu)?
+            .edge
+            .ok_or_else(|| SolidError::null_pointer(OP_CLIFF))?;
+        let curve_3d = target
+            .edge(edge)?
+            .curve
+            .as_ref()
+            .ok_or_else(|| SolidError::null_pointer(OP_CLIFF))?;
+        let ivl = crate::topology::edge::interval(target, edge)?;
+        let solutions = fillet_surface.global_curve_intersect(
+            k,
+            [
+                CliffHandle::Curve(curve_3d),
+                CliffHandle::Surface(fillet_surface),
+            ],
+            &fillet_surface.natural_uv_domain_with_nurb(k)?,
+            curve_3d,
+            &ivl,
+            this_approx_tol_3d,
+        )?;
+        let near = self.brep.vertex(v)?.point;
+        let mut best: Option<(f64, Point3)> = None;
+        for i in 0..solutions.len() {
+            let Some(&t) = solutions.get(i).and_then(|s| s.start.parameters.first()) else {
+                continue;
+            };
+            let p = curve_3d.evaluate_point(k, t)?;
+            let d = p.distance(near);
+            if best.is_none_or(|(bd, _)| d < bd) {
+                best = Some((d, p));
+            }
+        }
+        let (_, pnt) = best.ok_or_else(|| SolidError::sm_err(OP_CLIFF))?;
+        self.set_vertex_point(v, pnt)?;
+        self.fillet_vertex_mut(v)?.set_status(FilStatus::Processed);
+        Ok(())
+    }
+
     /// `SmVertex::SetPoint`: `Notify(SM_NO_CHANGE_GEOMETRY)` resets the cached gaps of
     /// every vertex use of the vertex, then the point is stored.
     pub(crate) fn set_vertex_point(&mut self, v: VertexId, point: Point3) -> Result<()> {

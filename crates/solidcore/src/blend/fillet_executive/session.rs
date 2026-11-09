@@ -6732,6 +6732,8 @@ impl CornerAdjustmentAccess<FilletObject> for SessionObjects<'_> {
         let corner = corners
             .get_mut(id.0 as usize)
             .ok_or_else(|| invalid("corner is not live"))?;
+        // Not upstream (WR-765): a rail past its side edge splits the end rib
+        corner.adjust_rolled_rail_ends(k, target, pseudo, Some(id))?;
         let mut context = SessionNx2Adjust {
             k,
             target,
