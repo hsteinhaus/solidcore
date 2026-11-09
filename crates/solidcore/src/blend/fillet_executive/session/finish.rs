@@ -44,6 +44,7 @@ use crate::blend::fillet_cliff_overflow::Refusal;
 use crate::blend::fillet_executive::p3::{
     ErrorInfo, FilletExecutive, FilletFinishAccess, StitchAttempt, StitchSettings,
 };
+use crate::blend::fillet_geom::p1::FilletBrep;
 use crate::blend::fillet_geom::p1::FilletErrorType;
 use crate::blend::fillet_solver::p1::FilletSurfaceGeneratorType;
 use crate::error::{EntityRef, Result, SolidError};
@@ -52,6 +53,7 @@ use crate::geom::tol::approx_tol3d;
 use crate::kernel::Kernel;
 use crate::surface::procedural_blend::NetScope;
 use crate::topology::brep::{p1, p3};
+use crate::topology::VertexId;
 use crate::topology::{BrepId, EdgeId};
 
 const OP: &str = "blend::fillet_executive::session::finish";
@@ -974,8 +976,74 @@ impl FilletSession<'_> {
             &tags,
         );
         let cleanup = super::original_merge::destroy_tags(&mut self.objects, &tags);
-        result.and(cleanup)
+        result.and(cleanup)?;
+        place_rolled_crossings(k, self.objects.target, &self.objects.pseudo)
     }
+}
+
+/// Not upstream (WR-766): the vertex where a round's end crosses the end face's edge with the
+/// face a rolled rail ends on (`FilletCorner::adjust_rolled_rail_ends`) is that crossing, on
+/// the round, the end face and the next face. It lies within tolerance of the edge's old end
+/// (Knoten_laminiert's Fillet4: 1.4e-5), and the merge kept whichever of the two points its
+/// order met first. A body vertex within its tolerance of a crossing is put on the crossing
+/// where that point lies nearer all the vertex's faces than its own.
+///
+/// # Errors
+/// Those of the face-gap evaluations.
+fn place_rolled_crossings(
+    k: &mut Kernel,
+    target: &mut crate::topology::Brep,
+    pseudo: &FilletBrep,
+) -> Result<()> {
+    use crate::blend::fillet_geom::p1::FilletVertexType;
+    use crate::topology::{vertex, vertexuse};
+    let crossings: Vec<_> = pseudo
+        .brep()
+        .vertices()
+        .iter()
+        .filter(|(v, _)| {
+            pseudo.fillet_vertex(*v).is_ok_and(|f| {
+                f.is_processed() && f.fillet_vertex_type() == FilletVertexType::FilletXEdgeuse
+            })
+        })
+        .map(|(_, r)| r.point)
+        .collect();
+    let face_gap = |k: &Kernel, b: &mut crate::topology::Brep, v: VertexId| -> Result<f64> {
+        let mut most = 0.0f64;
+        for vu in vertex::vertexuses(b, v)? {
+            if let Some(g) = vertexuse::vertex_face_gap(k, b, vu, true)? {
+                if g.gap_3d >= 0.0 {
+                    most = most.max(g.gap_3d);
+                }
+            }
+        }
+        Ok(most)
+    };
+    for p in crossings {
+        let mut near: Option<(f64, VertexId)> = None;
+        for v in p1::vertices(target, None)? {
+            let d = vertex::point(target, v)?.distance(p);
+            if d <= vertex::tolerance(target, v)? && near.is_none_or(|(nd, _)| d < nd) {
+                near = Some((d, v));
+            }
+        }
+        let Some((d, v)) = near else { continue };
+        if d == 0.0 {
+            continue;
+        }
+        let own = vertex::point(target, v)?;
+        let at_own = face_gap(k, target, v)?;
+        target.vertex_mut(v)?.point = p;
+        let at_crossing = face_gap(k, target, v)?;
+        if at_crossing >= at_own {
+            target.vertex_mut(v)?.point = own;
+        }
+        for vu in vertex::vertexuses(target, v)? {
+            vertexuse::init_vertex_face_gap(target, vu)?;
+            target.vertexuse_mut(vu)?.vertex_edge_gap.reset();
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
