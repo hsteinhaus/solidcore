@@ -1,0 +1,7 @@
+#### WR-764. An offset pole's collapsed side takes the normals' round-off for a tangent
+- **Severity:** Wrong result (a shell refused, status 1001: SolidCraft's Haube Shell1)
+- **Area:** Offset surface (evaluation at a pole of the base; follows WR-761)
+- **Location:** Rust: `crates/solidcore/src/surface/offset_surface.rs`, `exact_at_pole`.
+- **What happens:** WR-761 takes the offset's derivative along a pole's collapsed side as the distance times the base normal's central difference along the side. At a regular pole the normal does not change, and the difference is round-off: on a modelled dome's apex (tangent ring flat to round-off) 1e-13 to 1e-11, not zero. An exact-tangent evaluation then shows neither a singular point (the normal the caller supplies is not used, the tangent not rebuilt) nor a tangent: in a curve-surface intersection's classification `evaluate_geometric`'s fundamental forms degenerate (1001).
+- **Fix:** a derivative shorter than `tol` (the test that took the base's side for collapsed) is the regular pole's: exactly zero in a Simple evaluation; elsewhere the step-off's derivative stands, not a floored round-off direction.
+- **Confirmed:** `surface::offset_surface::tests::a_domes_offset_has_no_tangent_along_its_apex` (a bicubic quarter dome, offset ±0.2: no tangent along the apex, its geometric properties evaluate); SolidCraft's Haube Shell1 shells again (89 faces, 22742.80 mm³), Knoten_laminiert Shell1 as before.
