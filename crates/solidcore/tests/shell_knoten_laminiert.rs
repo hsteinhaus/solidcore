@@ -80,3 +80,21 @@ fn the_rounds_offsets_keep_their_trims_on_their_extensions() {
         );
     }
 }
+
+/// Shell1 builds as Fusion's: 56 faces, 4603.714 mm³, a manifold solid (with WR-759 to
+/// WR-763: the pole made exact, the trims kept on the extensions, the offset of the pole
+/// evaluated, the slits removed, the free wires' shells kept).
+#[test]
+fn shell1_is_fusions() {
+    use solidcore::mass::integrator::properties::{brep_volume, PropertyAttributes};
+    let mut out = shell1().unwrap();
+    assert_eq!(p1::faces(&out, None).unwrap().len(), 56);
+    assert!(solidcore::topology::brep::p2::is_manifold_solid(&out).unwrap());
+    let store = AttributeStore::default();
+    let attrs = PropertyAttributes {
+        store: &store,
+        key_of: &|_| ObjectKey(0),
+    };
+    let volume = brep_volume(&Kernel::default(), &mut out, 1e-8, &attrs).unwrap();
+    assert!((volume - 4603.714).abs() < 1e-3, "{volume}");
+}
