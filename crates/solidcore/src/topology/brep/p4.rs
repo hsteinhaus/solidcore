@@ -1442,12 +1442,20 @@ fn delete_wire_edge(
 
     destroy_edge(k, b, env, e)?;
 
+    // Not upstream (WR-763): only a wire shell is made the vertex shell of a freed end;
+    // the wire of a faceuse shell leaves it its face uses, the end a shell of its own (as
+    // the branch with one free end below does)
+    let wire_shell = shell_is_wire_shell(b, shell)?;
     if v1 == v2 {
         if vertex::is_shell_vertex(b, v1)? {
-            // reset the shell parameters to be a vertexShell
             let head = vertex::primary_vertexuse(b, v1)?;
-            set_shell_head(b, shell, vu_head(head), Some(ShellType::Vertex))?;
-        } else if shell_is_wire_shell(b, shell)? {
+            if wire_shell {
+                // reset the shell parameters to be a vertexShell
+                set_shell_head(b, shell, vu_head(head), Some(ShellType::Vertex))?;
+            } else {
+                new_vertex_shell(b, shell, head)?;
+            }
+        } else if wire_shell {
             // give the shell a new primary Edgeuse
             let vu = deref(vertex::primary_vertexuse(b, v1)?, OP)?;
             let head = vertexuse::edgeuse(b, vu)?;
@@ -1462,7 +1470,11 @@ fn delete_wire_edge(
     let v2_shell = vertex::is_shell_vertex(b, v2)?;
     if v1_shell && v2_shell {
         // give V1 to the existing shell and create a new shell for V2
-        set_shell_head(b, shell, vu_head(vu1), Some(ShellType::Vertex))?;
+        if wire_shell {
+            set_shell_head(b, shell, vu_head(vu1), Some(ShellType::Vertex))?;
+        } else {
+            new_vertex_shell(b, shell, vu1)?;
+        }
         new_vertex_shell(b, shell, vu2)?;
         delete_edgeuse(k, b, env, eu)?;
         delete_edgeuse(k, b, env, eu_mate)?;
