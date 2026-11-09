@@ -384,11 +384,12 @@ fn offset_base(k: &Kernel, s: &Nurb, b: &Binomials) -> Result<OffsetBase> {
                 .collect::<Result<Vec<_>>>()
         })
         .collect::<Result<Vec<_>>>()?;
+    // (WR-759) the normals with each patch's pole at the origin exactly
     let normals = ps
         .iter()
         .map(|row| {
             row.iter()
-                .map(|p| pole_normal(p, b))
+                .map(|p| pole_normal(&regular_poles_at_origin(p, k.tolerances.zone_tol_3d)?, b))
                 .collect::<Result<Vec<_>>>()
         })
         .collect::<Result<Vec<_>>>()?;
@@ -1063,7 +1064,13 @@ pub fn certified_offset(k: &Kernel, s: &Nurb, d: f64, tol: f64) -> Result<Certif
                     w: spatch.w.as_ref().map(|w| w.restrict(s0, s1, t0, t1)),
                 };
                 // the tangents of the base patch, restricted: exact zeros along a pole kept
-                let (au, av) = homogeneous_tangents(spatch, &b)?;
+                // (WR-759: read with the pole at the origin, where a rational side's
+                // homogeneous points vanish exactly; the tangents do not change with the
+                // move)
+                let (au, av) = homogeneous_tangents(
+                    &regular_poles_at_origin(spatch, k.tolerances.zone_tol_3d)?,
+                    &b,
+                )?;
                 let tangents = (
                     restrict3(&au, s0, s1, t0, t1),
                     restrict3(&av, s0, s1, t0, t1),
@@ -1383,6 +1390,19 @@ pub fn proved_singular(
 /// frame's, gets the pole's normal coordinate exactly. `Q` is invariant under the move;
 /// the snaps stay within `tol`. Weights stay as they are.
 fn regular_poles(patch: &Patch, tol: f64, frame: bool) -> Result<Patch> {
+    regular_poles_moved(patch, tol, frame, false)
+}
+
+/// [`regular_poles`] moved (translated only, not turned) so its first pole is the origin
+/// exactly (WR-759): the patch's normal, invariant under the move, read there, where a
+/// rational pole's homogeneous points vanish exactly ([`pole_normal`]).
+fn regular_poles_at_origin(patch: &Patch, tol: f64) -> Result<Patch> {
+    regular_poles_moved(patch, tol, false, true)
+}
+
+/// [`regular_poles`], with `translate` (without `frame`) the patch moved so its first pole
+/// is the origin.
+fn regular_poles_moved(patch: &Patch, tol: f64, frame: bool, translate: bool) -> Result<Patch> {
     let [px, py, pz] = &patch.p;
     let (du, dv) = px.degrees();
     let width = dv + 1;
@@ -1412,6 +1432,7 @@ fn regular_poles(patch: &Patch, tol: f64, frame: bool) -> Result<Patch> {
     }
     let at = |e: &[Vec3], i: usize| e.get(i).copied().unwrap_or(Vec3::new(0.0, 0.0, 0.0));
     let mut framed = false;
+    let mut translated = false;
     // a line of control points within `tol` of its mean
     let collapsed = |e: &[Vec3], line: &[usize]| {
         let n = line.len().max(1) as f64;
@@ -1431,6 +1452,7 @@ fn regular_poles(patch: &Patch, tol: f64, frame: bool) -> Result<Patch> {
             .iter()
             .fold(Vec3::new(0.0, 0.0, 0.0), |a, &i| a + at(&e, i))
             * (1.0 / n);
+        let mut at_origin = false;
         if frame && !framed {
             // the tangent plane: the ring's spokes from the pole, summed pairwise
             let mut normal = Vec3::new(0.0, 0.0, 0.0);
@@ -1455,12 +1477,25 @@ fn regular_poles(patch: &Patch, tol: f64, frame: bool) -> Result<Patch> {
                     *q = Vec3::new(r.dot(x), r.dot(y), r.dot(z));
                 }
                 framed = true;
+                at_origin = true;
             }
+        } else if translate && !framed && !translated {
+            for q in &mut e {
+                *q = *q - pole;
+            }
+            translated = true;
+            at_origin = true;
         }
-        let pole = side
-            .iter()
-            .fold(Vec3::new(0.0, 0.0, 0.0), |a, &i| a + at(&e, i))
-            * (1.0 / n);
+        // (WR-759) the pole the frame (or translation) moved to is its origin, exactly: a rational side's
+        // homogeneous points (the pole times each weight) then vanish with it, as a
+        // polynomial side's derivatives do; the side's mean is that origin to round-off only
+        let pole = if at_origin {
+            Vec3::new(0.0, 0.0, 0.0)
+        } else {
+            side.iter()
+                .fold(Vec3::new(0.0, 0.0, 0.0), |a, &i| a + at(&e, i))
+                * (1.0 / n)
+        };
         for &i in side {
             if let Some(q) = e.get_mut(i) {
                 *q = pole;
@@ -1862,6 +1897,46 @@ mod tests {
         Nurb::new(net, 3, 3, knots.clone(), knots).unwrap()
     }
 
+    /// [`domed_quarter`] made rational with the weights `0.5^j` along v (column `j`): for a
+    /// Bezier patch a reparameterisation in v, the same dome. Its apex row is one point,
+    /// but its homogeneous points are the pole times weights that differ, as on a fillet's
+    /// conic-pair round that ends at a node (WR-759).
+    fn weighted_domed_quarter(tilted: bool) -> Nurb {
+        let s = domed_quarter(tilted);
+        let rows: Vec<Vec<CPoint>> = (0..4)
+            .map(|i| {
+                (0..4)
+                    .map(|j| {
+                        let p = s.cpt(i, j).unwrap();
+                        let w = 0.5f64.powi(j as i32);
+                        CPoint::new(p.x * w, p.y * w, p.z * w, w)
+                    })
+                    .collect()
+            })
+            .collect();
+        let knots = vec![0., 0., 0., 0., 1., 1., 1., 1.];
+        Nurb::new(rows, 3, 3, knots.clone(), knots).unwrap()
+    }
+
+    /// A rational pole is regular as the polynomial one is: its side is made one point at
+    /// the frame's origin exactly, so its homogeneous points (the pole times each weight)
+    /// vanish with it, the side's common factor divides out, and a thin wall either way
+    /// certifies. With the side's mean (round-off off the origin) instead, the forms do not
+    /// vanish there, and the wall was refused naming 0 (WR-759).
+    #[test]
+    fn weighted_domed_quarter_with_a_pole_certifies() {
+        for tilted in [false, true] {
+            let s = weighted_domed_quarter(tilted);
+            for d in [1.0, -1.0] {
+                assert_eq!(
+                    certify_regular(&Kernel::default(), &s, d, None).unwrap(),
+                    Regularity::Regular,
+                    "d {d} tilted {tilted}"
+                );
+            }
+        }
+    }
+
     /// The pole at the apex is regular: a thin wall either way certifies, and a wall past
     /// the radius folds on one side only, naming the radius (not 0 from the pole).
     #[test]
@@ -1916,6 +1991,24 @@ mod tests {
                         "d {d} tilted {tilted}: ring {off} off the plane"
                     );
                 }
+                assert!(made.bound <= 1e-4, "d {d} tilted {tilted}: {}", made.bound);
+                let err = sampled_error(&s, &made.surface, d);
+                assert!(err <= 1e-4, "d {d} tilted {tilted}: {err}");
+            }
+        }
+    }
+
+    /// The rational dome's offset through its pole is certified as the polynomial one's is
+    /// (WR-759): the pole normals are read with the pole at the origin, where its rational
+    /// side's homogeneous points vanish exactly, not at the side's mean, where they leave
+    /// the normal 0 at the pole (`Degenerate`).
+    #[test]
+    fn weighted_domed_quarter_offset_is_certified_through_its_pole() {
+        for tilted in [false, true] {
+            let s = weighted_domed_quarter(tilted);
+            for d in [0.2, -0.2] {
+                let made = certified_offset(&Kernel::default(), &s, d, 1e-4)
+                    .unwrap_or_else(|e| panic!("d {d} tilted {tilted}: {e:?}"));
                 assert!(made.bound <= 1e-4, "d {d} tilted {tilted}: {}", made.bound);
                 let err = sampled_error(&s, &made.surface, d);
                 assert!(err <= 1e-4, "d {d} tilted {tilted}: {err}");
