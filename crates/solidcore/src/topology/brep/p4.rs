@@ -2309,4 +2309,54 @@ mod tests {
         assert!(matches!(r, Err(SolidError::InvalidInput { .. })));
         assert_eq!(b.face(f).unwrap().rectangular_trim, face2::UNSURE);
     }
+
+    /// A wire edge of a faceuse shell whose two ends touch nothing else (as a merge leaves
+    /// one, once the wires of other shells at its ends are gone): deleting it leaves its
+    /// ends a vertex shell each and the faceuse shell its face uses, as the branch with
+    /// one free end does. Made the shell's vertex shell, it dropped the cube's six face
+    /// uses, which kept naming the shell after its vertex was deleted.
+    #[test]
+    fn a_free_wire_of_a_faceuse_shell_leaves_the_shell_its_faces() {
+        let mut k = Kernel::default();
+        let mut b = crate::primitive::api_primitives::create_box(
+            &mut k,
+            crate::math::Point3::ZERO,
+            10.0,
+            10.0,
+            10.0,
+        )
+        .unwrap();
+        b.set_editing_enabled(true);
+        let infinite = b.infinite_region().unwrap();
+        let cube = b.region(infinite).unwrap().shells[0];
+        let faceuses = b.shell(cube).unwrap().get_faceuses().unwrap();
+        assert_eq!(faceuses.len(), 6);
+        // a free wire in a shell of its own, then moved into the cube's outside shell
+        let (wire_shell, v0) = brep2::make_shell_vertex_topology(&mut b, None).unwrap();
+        let (e, v1) = brep2::make_edge_vertex_topology(&mut b, None, v0).unwrap();
+        shell::transfer_children(&mut k, &mut b, wire_shell, cube, None).unwrap();
+        shell::region_remove_shell(&mut b, infinite, wire_shell).unwrap();
+        b.remove_shell_record(wire_shell).unwrap();
+        assert_eq!(
+            eu1::shell(&b, b.edge(e).unwrap().edgeuses[0]).unwrap(),
+            Some(cube)
+        );
+
+        with_local_env(|env| delete_edge(&mut k, &mut b, env, e, None)).unwrap();
+
+        assert!(b.shell(cube).unwrap().is_faceuse_shell());
+        assert_eq!(b.shell(cube).unwrap().get_faceuses().unwrap(), faceuses);
+        let mut owners = Vec::new();
+        for v in [v0, v1] {
+            let vu = vertex::primary_vertexuse(&b, v).unwrap().unwrap();
+            let VertexuseOwner::Shell(Some(s)) = b.vertexuse(vu).unwrap().owner else {
+                panic!("{v:?} is no shell vertex");
+            };
+            assert!(b.shell(s).unwrap().is_vertex_shell());
+            assert_eq!(b.shell(s).unwrap().members, ShellMembers::Vertexuse(vu));
+            owners.push(s);
+        }
+        assert_ne!(owners[0], owners[1]);
+        assert!(!owners.contains(&cube));
+    }
 }
