@@ -4438,4 +4438,65 @@ mod tests {
             assert_ne!(sides & SS_VMAX, 0, "d {d}: sides {sides:#x}");
         }
     }
+
+    /// A modelled dome's apex (WR-764): a bicubic quarter of a hemisphere of radius 50, `u` up
+    /// to the apex, whose apex row of control points is one point and whose tangent ring is
+    /// flat only to round-off (cosines and sines). Its offset's derivative along the collapsed
+    /// side (`v` at `u` max) is the offset distance times the normal's change along the side:
+    /// none at a regular pole, so exactly zero in an exact-tangent evaluation, and the point
+    /// is singular there with the base's normal standing in, as a curve-surface intersection's
+    /// classification takes it. The normals' round-off difference over the side's step was
+    /// taken for the derivative (1e-11): neither singular nor a tangent, the fundamental forms
+    /// degenerated and the classification failed (1001, SolidCraft's Haube Shell1).
+    #[test]
+    fn a_domes_offset_has_no_tangent_along_its_apex() {
+        use crate::nurbs::b_spline_surface::BSplineSurface;
+        use crate::nurbs::math::{CPoint, NOW};
+        use crate::nurbs::srf_basic::Surface as Nurb;
+        use crate::surface::surface::p2::evaluate_geometric;
+        let (r, c) = (50.0, 0.552_284_749_830_793_4);
+        let quarter = [(1.0, 0.0), (1.0, c), (c, 1.0), (0.0, 1.0)];
+        let net = quarter
+            .iter()
+            .map(|&(rad, z)| {
+                quarter
+                    .iter()
+                    .map(|&(cx, cy)| CPoint::new(r * rad * cx, r * rad * cy, r * z, NOW))
+                    .collect()
+            })
+            .collect();
+        let knots = vec![0., 0., 0., 0., 1., 1., 1., 1.];
+        let dome = Nurb::new(net, 3, 3, knots.clone(), knots).unwrap();
+        let k = Kernel::default();
+        let base = Surface::from(BSplineSurface::from_gw_nurb(&dome));
+        let domain = base.natural_uv_domain_with_nurb(&k).unwrap();
+        let flags = EvaluateFlags {
+            u_side: Side::Left,
+            v_side: Side::Left,
+            only_upper_half: true,
+            non_zero_tangents: false,
+        };
+        for d in [0.2, -0.2] {
+            let off =
+                Surface::from(OffsetSurface::new(&k, d, base.clone(), true, SS_UNKNOWN).unwrap());
+            for i in 0..=4 {
+                let uv = Point2::new(
+                    domain.max().x,
+                    domain.min().y + domain.y_length() * f64::from(i) / 4.0,
+                );
+                let m = off.evaluate(&k, uv, 2, 2, flags).unwrap();
+                let mut pvv = [[Vec3::UNDEF; 3]; 3];
+                for (a, row) in pvv.iter_mut().enumerate() {
+                    for (b, slot) in row.iter_mut().enumerate() {
+                        if a + b <= 2 {
+                            *slot = m[a][b];
+                        }
+                    }
+                }
+                assert_eq!(pvv[0][1], Vec3::ZERO, "d {d} uv {uv:?}");
+                pvv[2][2] = off.evaluate_normal(&k, uv, Side::Left, Side::Left).unwrap();
+                evaluate_geometric(&mut pvv).unwrap_or_else(|e| panic!("d {d} uv {uv:?}: {e:?}"));
+            }
+        }
+    }
 }
