@@ -71,6 +71,10 @@ use crate::topology::{loopuse, vertexuse, Brep, EdgeId, EdgeuseId, FaceId, LoopI
 
 const OP: &str = "offset::offset_executive::crossing_loops::resolve_crossing_loops";
 
+/// The most edge splits [`OffsetExecutive::remove_slits`] makes in one face (each makes a
+/// slit end to end; a face has far fewer).
+const MAX_SLIT_SPLITS: usize = 1024;
+
 use crate::error::offset::{LoopCrossing, OffsetFailure, WallContact};
 use crate::error::Failure;
 // `SM_ERR_ASSERT_FAILURE`.
@@ -90,7 +94,8 @@ struct LoopStretch {
     lo: f64,
     hi: f64,
     /// `lStart`, `lEnd`: the nodes it starts and ends at, a crossing (`>= 0`) or the
-    /// vertex ending edge use `k` of the face (`-1 - k`).
+    /// vertex ending edge use `k` of the face (`-1 - k`); for a slit's stretches
+    /// ([`OffsetExecutive::remove_slits`]) a group of coincident vertices.
     start: i64,
     end: i64,
     /// `bKeep`: it bounds the face.
@@ -426,6 +431,258 @@ impl OffsetExecutive {
         status
     }
 
+    /// Not upstream (WR-762): every offset face whose loop holds a slit, two of its edges
+    /// running out and back between the same two vertices along one curve (they coincide
+    /// as `DoStitching` finds edges to glue, at the offset body's tolerance), is replaced
+    /// by the faces of the loop's parts either side of it. The face's region is those
+    /// parts, the slit bounds none of it: a side offset by a wall as thick as the side is
+    /// high keeps no height but at its ends. Merged as it is, both of the slit's edges
+    /// would be mated to the one edge they make. A face with no slit is left as it is.
+    ///
+    /// # Errors
+    ///
+    /// Those of the edge comparison and of [`OffsetExecutive::rebuild_from_stretches`].
+    pub(super) fn remove_slits(
+        &mut self,
+        kernel: &mut Kernel,
+        original: &mut Brep,
+        notifications: &mut OffsetNotifications<'_>,
+    ) -> Result<()> {
+        let mut offset = required(self.take_offset_brep())?;
+        let status = bp1::faces(&offset, None).and_then(|faces| {
+            faces.into_iter().try_for_each(|f| {
+                self.remove_slits_of_face(kernel, original, &mut offset, f, notifications)
+                    .map_err(|e| self.on_input_face(original, f, e))
+            })
+        });
+        self.set_offset_brep(offset);
+        status
+    }
+
+    /// [`OffsetExecutive::remove_slits`] of offset face `f`.
+    fn remove_slits_of_face(
+        &mut self,
+        kernel: &mut Kernel,
+        original: &mut Brep,
+        b: &mut Brep,
+        f: FaceId,
+        notifications: &mut OffsetNotifications<'_>,
+    ) -> Result<()> {
+        let mut fu = required(face::upward_faceuse(b, f)?)?;
+        if eu::faceuse_orientation(b, fu)? != OrientType::Same {
+            fu = required(eu::faceuse_mate(b, fu)?)?;
+        }
+        // The face's edge loops (the outer loop first) and the points of its vertex loops.
+        let mut loop_uses: Vec<crate::topology::LoopuseId> = Vec::new();
+        let mut loop_edgeuses: Vec<Vec<EdgeuseId>> = Vec::new();
+        let mut loop_points: Vec<Point3> = Vec::new();
+        for lu in eu::faceuse_loopuses(b, fu, false, None)? {
+            if let LoopuseStart::Vertexuse(_) = b.loopuse(lu)?.start {
+                let vus = loopuse::vertexuses(b, lu, None)?;
+                let vu = required(vus.first().copied().flatten())?;
+                loop_points.push(vertex_point(b, vertexuse::vertex(b, vu)?)?);
+                continue;
+            }
+            loop_uses.push(lu);
+            loop_edgeuses.push(eu::loopuse_edgeuses(b, lu)?);
+        }
+        let stitch_tol = |b: &Brep| b.tolerance();
+        // An edge use's start and end vertices, in the loop's direction.
+        let ends = |b: &Brep, edgeuse: EdgeuseId| -> Result<[crate::topology::VertexId; 2]> {
+            let e = edge_of(b, edgeuse)?;
+            let (s, t) = (
+                required(edge::start_vertex(b, e)?)?,
+                required(edge::end_vertex(b, e)?)?,
+            );
+            Ok(if eu::orientation(b, edgeuse)? == OrientType::Same {
+                [s, t]
+            } else {
+                [t, s]
+            })
+        };
+        let mut callback = crate::heal::stitch::p1::DefaultStitchCallback::new();
+        let mut stitch =
+            crate::heal::stitch::p1::Stitch::new(&mut callback, b.tolerance(), false, false);
+        // A slit along part of an edge: an edge of the loop runs from one end of another
+        // edge of the loop to a vertex of the loop lying on that edge. That edge is split
+        // there, as `DoStitching` splits edges at vertices (`TestAndSplitEdge`, at its
+        // tolerance), so the two make a slit end to end. Only the loop's own edges and
+        // vertices are looked at.
+        let mut splits = 0usize;
+        'split: loop {
+            for (ll, list) in loop_edgeuses.clone().iter().enumerate() {
+                for &edgeuse in list {
+                    let e = edge_of(b, edgeuse)?;
+                    let [es, et] = ends(b, edgeuse)?;
+                    for &other in list {
+                        if other == edgeuse {
+                            continue;
+                        }
+                        let [os, ot] = ends(b, other)?;
+                        // `other` from a vertex `v` (off `e`'s ends) to one of `e`'s ends
+                        for (v, w) in [(os, ot), (ot, os)] {
+                            let (w_at_end, v_at_end) = {
+                                let at_end = |x: crate::topology::VertexId| -> Result<bool> {
+                                    Ok(x == es
+                                        || x == et
+                                        || stitch.vertices_coincide(b, x, es)?
+                                        || stitch.vertices_coincide(b, x, et)?)
+                                };
+                                (at_end(w)?, at_end(v)?)
+                            };
+                            if !w_at_end || v_at_end {
+                                continue;
+                            }
+                            let tol = (stitch_tol(b)).max(
+                                crate::topology::vertex::tolerance(b, v)? + edge::tolerance(b, e)?,
+                            );
+                            let point = vertex_point(b, Some(v))?;
+                            let split =
+                                stitch.edit_test_and_split_edge(kernel, b, e, point, tol)?;
+                            if let Some(new_v) = split.new_vertex {
+                                // the new vertex's tolerance as `DoStitching` sets it
+                                let new_tol = crate::topology::vertex::tolerance(b, v)?
+                                    .max(crate::topology::vertex::tolerance(b, new_v)?);
+                                crate::topology::vertex::set_tolerance(
+                                    b,
+                                    new_v,
+                                    crate::geom::tol::zone_tol3d(kernel, new_tol),
+                                    true,
+                                    true,
+                                )?;
+                                splits += 1;
+                                if splits > MAX_SLIT_SPLITS {
+                                    return Err(assert_failure());
+                                }
+                                // the loop has changed: read it again
+                                let lu = *at(&loop_uses, ll)?;
+                                if let Some(slot) = loop_edgeuses.get_mut(ll) {
+                                    *slot = eu::loopuse_edgeuses(b, lu)?;
+                                }
+                                continue 'split;
+                            }
+                        }
+                    }
+                }
+            }
+            break;
+        }
+        // The slits: pairs of edge uses of one loop, of two edges, one running from the
+        // other's end to its start, the two coincident.
+        let mut in_slit: Vec<EdgeuseId> = Vec::new();
+        for list in &loop_edgeuses {
+            for (ii, &first) in list.iter().enumerate() {
+                for &second in list.iter().skip(ii + 1) {
+                    if in_slit.contains(&first) || in_slit.contains(&second) {
+                        continue;
+                    }
+                    let (e1, e2) = (edge_of(b, first)?, edge_of(b, second)?);
+                    if e1 == e2 {
+                        continue;
+                    }
+                    let ([s1, t1], [s2, t2]) = (ends(b, first)?, ends(b, second)?);
+                    let same = |v: crate::topology::VertexId, w: crate::topology::VertexId| {
+                        if v == w {
+                            Ok(true)
+                        } else {
+                            stitch.vertices_coincide(b, v, w)
+                        }
+                    };
+                    if same(s1, t1)? || !same(s1, t2)? || !same(t1, s2)? {
+                        continue;
+                    }
+                    if stitch.edges_coincide(kernel, b, e1, e2)? {
+                        in_slit.push(first);
+                        in_slit.push(second);
+                    }
+                }
+            }
+        }
+        if in_slit.is_empty() {
+            return Ok(());
+        }
+        // The loops' vertices, each coincident group (as `DoStitching` would glue them)
+        // one node.
+        let mut node_of: Vec<(crate::topology::VertexId, i64)> = Vec::new();
+        for list in &loop_edgeuses {
+            for &edgeuse in list {
+                for v in ends(b, edgeuse)? {
+                    if node_of.iter().any(|&(w, _)| w == v) {
+                        continue;
+                    }
+                    let mut node = None;
+                    for &(w, n) in &node_of {
+                        if stitch.vertices_coincide(b, v, w)? {
+                            node = Some(n);
+                            break;
+                        }
+                    }
+                    let fresh = -1 - index_i64(node_of.len())?;
+                    node_of.push((v, node.unwrap_or(fresh)));
+                }
+            }
+        }
+        drop(stitch);
+        let node = |v: crate::topology::VertexId| -> Result<i64> {
+            node_of
+                .iter()
+                .find(|&&(w, _)| w == v)
+                .map(|&(_, n)| n)
+                .ok_or_else(assert_failure)
+        };
+
+        // Every edge use is a stretch, kept but in a slit; the stretches meet at their
+        // vertices.
+        let mut edgeuses: Vec<EdgeuseId> = Vec::new();
+        let mut uvs: Vec<Curve> = Vec::new();
+        let mut stretches: Vec<LoopStretch> = Vec::new();
+        let mut tol_3d = self.approximation_tol_3d();
+        for (ll, list) in loop_edgeuses.iter().enumerate() {
+            for &edgeuse in list {
+                eu3::get_or_create_uv_trim_curve(kernel, b, edgeuse, false, false, true)?.status?;
+                let uv = required(eu::uv_trim_curve(b, edgeuse)?.0.cloned())?;
+                let e = edge_of(b, edgeuse)?;
+                let ivl = b.edge(e)?.interval;
+                if !uv.natural_interval().are_equal(&ivl, 0.0) {
+                    return Err(assert_failure());
+                }
+                if !eu::edge_is_lamina(b, e)? {
+                    return Err(unresolved(LoopCrossing::SharesEdge));
+                }
+                let [s, t] = ends(b, edgeuse)?;
+                stretches.push(LoopStretch {
+                    loop_index: ll,
+                    edgeuse,
+                    uv: uvs.len(),
+                    lo: ivl.min(),
+                    hi: ivl.max(),
+                    start: node(s)?,
+                    end: node(t)?,
+                    keep: !in_slit.contains(&edgeuse),
+                    floor: false,
+                    mid: edge_curve(b, e)?.evaluate_point(kernel, ivl.mid())?,
+                });
+                edgeuses.push(edgeuse);
+                uvs.push(uv);
+                tol_3d = tol_3d.max(b.edge(e)?.tolerance);
+            }
+        }
+        tol_3d *= 10.0;
+        self.rebuild_from_stretches(
+            kernel,
+            original,
+            b,
+            f,
+            stretches,
+            &[],
+            &edgeuses,
+            &uvs,
+            loop_points,
+            tol_3d,
+            notifications,
+        )
+    }
+
     /// `e`, a refusal of offset face `f`, naming the face of `original` that
     /// `f` comes from where the refusal names no face and `f` comes from exactly one
     /// (not upstream, #2615: error context only; any other error is returned as it is).
@@ -753,6 +1010,49 @@ impl OffsetExecutive {
             }
         }
 
+        self.rebuild_from_stretches(
+            kernel,
+            original,
+            b,
+            f,
+            stretches,
+            &floor_loops,
+            &edgeuses,
+            &uvs,
+            loop_points,
+            tol_3d,
+            notifications,
+        )
+    }
+
+    /// The tail of `ResolveCrossingLoopsOfFace` (fork, not upstream), shared with
+    /// [`OffsetExecutive::remove_slits`]: replaces offset face `f` of `b` with the faces its
+    /// kept `stretches` bound (closed into loops where one ends and the next starts, one
+    /// face per loop holding a stretch of its outer loop, the inner loops in the one outer
+    /// loop's face) and the `floor_loops` regions that are cavity, each made from its
+    /// stretches' edge curves and UV trim curves (`uvs`, by `LoopStretch::uv`) on a copy
+    /// of its surface; the new faces, edges and vertices take the attributes and
+    /// offset-map places of those they come from (by points within `tol_3d`), and `f` goes.
+    ///
+    /// # Errors
+    ///
+    /// `SM_ERR_BAD_INTERSECTIONS` for stretches that do not close into loops one way;
+    /// those of the face construction and the notifications.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // one fork routine's tail
+    fn rebuild_from_stretches(
+        &mut self,
+        kernel: &mut Kernel,
+        original: &mut Brep,
+        b: &mut Brep,
+        f: FaceId,
+        mut stretches: Vec<LoopStretch>,
+        floor_loops: &[Vec<usize>],
+        edgeuses: &[EdgeuseId],
+        uvs: &[Curve],
+        loop_points: Vec<Point3>,
+        tol_3d: f64,
+        notifications: &mut OffsetNotifications<'_>,
+    ) -> Result<()> {
         // Close the kept stretches into loops: each goes on to the one kept stretch that
         // starts where it ends (at a crossing, the stretch of the other loop that bounds
         // the face).
@@ -846,7 +1146,7 @@ impl OffsetExecutive {
                     let mut ivl_3d = Extent1d::from_min_max(stretch.lo, stretch.hi);
                     curve_3d.trim(kernel, &mut ivl_3d, TrimMode::Notify)?;
                     curves_3d.push(Some(curve_3d));
-                    let mut uv_curve = at(&uvs, stretch.uv)?.copy(kernel)?;
+                    let mut uv_curve = at(uvs, stretch.uv)?.copy(kernel)?;
                     let mut ivl_uv = Extent1d::from_min_max(stretch.lo, stretch.hi);
                     uv_curve.trim(kernel, &mut ivl_uv, TrimMode::Notify)?;
                     uv_curves.push(uv_curve);
@@ -883,7 +1183,7 @@ impl OffsetExecutive {
         // Fork 1b016ca: the regions the loops wind round the other way that are cavity,
         // each a face on the surface turned over (the loop runs round the region the
         // other way).
-        for chain in &floor_loops {
+        for chain in floor_loops {
             let mut input = FaceCurvesInput::default();
             input.loops.push(chain.len());
             let mut curves_3d = Vec::new();
@@ -895,7 +1195,7 @@ impl OffsetExecutive {
                 let mut ivl_3d = Extent1d::from_min_max(stretch.lo, stretch.hi);
                 curve_3d.trim(kernel, &mut ivl_3d, TrimMode::Notify)?;
                 curves_3d.push(Some(curve_3d));
-                let mut uv_curve = at(&uvs, stretch.uv)?.copy(kernel)?;
+                let mut uv_curve = at(uvs, stretch.uv)?.copy(kernel)?;
                 let mut ivl_uv = Extent1d::from_min_max(stretch.lo, stretch.hi);
                 uv_curve.trim(kernel, &mut ivl_uv, TrimMode::Notify)?;
                 uv_curves.push(uv_curve);
@@ -1064,7 +1364,7 @@ impl OffsetExecutive {
                 self.blend_to_faces.relate_pair(blend, new_face)?;
             }
         }
-        for &edgeuse in &edgeuses {
+        for &edgeuse in edgeuses {
             for old in [Some(edgeuse), eu::mate(b, edgeuse)?] {
                 let old = required(old)?;
                 for original in self.edgeuse_to_edgeuses.firsts(old) {
