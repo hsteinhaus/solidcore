@@ -3263,11 +3263,7 @@ fn exact_at_pole(
     let (Some(n0), Some(n1)) = (normal(at(t0))?, normal(at(t1))?) else {
         return Ok(Some((point, None)));
     };
-    let mut along = (n1 - n0) * (offset_distance / (t1 - t0));
-    // never a zero first derivative where not doing a Simple evaluation
-    if floor && along.length() < tol {
-        along = along.unitize_or_z() * (tol * 1.1);
-    }
+    let along = (n1 - n0) * (offset_distance / (t1 - t0));
     let slot = if u_collapsed {
         Some(hv + 1)
     } else if hv >= 1 {
@@ -3275,6 +3271,20 @@ fn exact_at_pole(
     } else {
         None
     };
+    // (WR-764) where the normal does not change along the side (a regular pole: the
+    // difference is round-off), the offset's side collapses by the test the base's does (a
+    // derivative shorter than `tol`): exactly zero in a Simple evaluation, so the point is
+    // singular there; elsewhere the step-off's derivative stands (never a zero one there)
+    if along.length() < tol {
+        return Ok(Some((
+            point,
+            if floor {
+                None
+            } else {
+                slot.map(|i| (i, Vec3::ZERO))
+            },
+        )));
+    }
     Ok(Some((point, slot.map(|i| (i, along)))))
 }
 
