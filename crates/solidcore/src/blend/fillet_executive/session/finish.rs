@@ -992,9 +992,9 @@ impl FilletSession<'_> {
 /// the round, the end face and the next face. It lies within tolerance of the edge's old end
 /// (Knoten_laminiert's Fillet4: 1.4e-5), and the merge kept whichever of the two points its
 /// order met first. A body vertex within its tolerance of a crossing is put on the crossing
-/// where that point lies nearer all the vertex's faces than its own; the vertices moved are
-/// returned (their edges still end where the vertex was: `UpdateVertexEdgeIntervals` brings
-/// them to it).
+/// where that point lies nearer all the vertex's faces than its own. Every vertex at a crossing
+/// is returned: the edges it has from the body may still end at the seam's old end, which
+/// `UpdateVertexEdgeIntervals` brings to the vertex.
 ///
 /// # Errors
 /// Those of the face-gap evaluations.
@@ -1004,7 +1004,7 @@ fn place_rolled_crossings(
     crossings: &[crate::math::Point3],
 ) -> Result<Vec<VertexId>> {
     use crate::topology::{vertex, vertexuse};
-    let mut moved = Vec::new();
+    let mut placed = Vec::new();
     let face_gap = |k: &Kernel, b: &mut crate::topology::Brep, v: VertexId| -> Result<f64> {
         let mut most = 0.0f64;
         for vu in vertex::vertexuses(b, v)? {
@@ -1025,6 +1025,9 @@ fn place_rolled_crossings(
             }
         }
         let Some((d, v)) = near else { continue };
+        // On the crossing or kept where it is, the edges it has from the body may still end at
+        // the seam's old end.
+        placed.push(v);
         if d == 0.0 {
             continue;
         }
@@ -1034,15 +1037,13 @@ fn place_rolled_crossings(
         let at_crossing = face_gap(k, target, v)?;
         if at_crossing >= at_own {
             target.vertex_mut(v)?.point = own;
-        } else {
-            moved.push(v);
         }
         for vu in vertex::vertexuses(target, v)? {
             vertexuse::init_vertex_face_gap(target, vu)?;
             target.vertexuse_mut(vu)?.vertex_edge_gap.reset();
         }
     }
-    Ok(moved)
+    Ok(placed)
 }
 
 /// The fillet-built vertices where a round's end crosses a seam it rolls over
