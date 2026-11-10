@@ -128,8 +128,8 @@ fn the_rounds_end_crosses_the_seam_where_it_lies() {
     }
 }
 
-/// The edges at the crossing end on it: put there, the vertex takes the edges that ended at the
-/// seam's old end with it (Knoten_laminiert's straight seam edges ended 1.4e-5 past their vertex,
+/// Every edge ends on its vertices, those at the crossings too: put there, a vertex takes the
+/// edges that ended at the seam's old end with it (Knoten_laminiert's straight seam edges ended 1.4e-5 past their vertex,
 /// and a sketch projecting one drew it so, where Fusion's line ends on the vertex).
 #[test]
 fn the_edges_at_the_crossing_end_on_it() {
@@ -152,30 +152,24 @@ fn the_edges_at_the_crossing_end_on_it() {
         edge_between(&b, Point3::new(0.0, 20.0, 0.0), Point3::new(0.0, 20.0, 1.0)),
     ];
     fillet_edges(&mut k, &mut b, &corners, r, 1, 1, 1.0).unwrap();
-    let dy = r - (r * r - (r - 8.0) * (r - 8.0)).sqrt();
-    for crossing in [Point3::new(8.0, dy, 1.0), Point3::new(8.0, 20.0 - dy, 1.0)] {
-        let v = p1::vertices(&b, None)
-            .unwrap()
-            .into_iter()
-            .find(|&v| vertex::point(&b, v).unwrap().distance(crossing) < 1e-9)
-            .expect("the crossing's vertex");
-        let at = vertex::point(&b, v).unwrap();
-        for e in vertex::edges(&b, v, None).unwrap() {
-            let ivl = edge::interval(&b, e).unwrap();
-            let t = if edge::start_vertex(&b, e).unwrap() == Some(v) {
-                ivl.min()
-            } else {
-                ivl.max()
-            };
-            let curve = edge::curve(&b, e).unwrap().unwrap();
-            let end = curve.evaluate_point(&k, t).unwrap();
-            // A line ends on the vertex; a fitted curve (the round's) as near as it comes to it.
-            let line = matches!(curve.kind(), CurveKind::Line(_));
-            assert!(
-                end.distance(at) < if line { 1e-9 } else { 1e-8 },
-                "{e:?} ends {} from {at:?}",
-                end.distance(at)
-            );
+    // Every edge of the body ends on its vertices: a line on the vertex, a fitted curve (the
+    // round's) within 1e-8.
+    let mut off = Vec::new();
+    for e in p1::edges(&b, None).unwrap() {
+        let curve = edge::curve(&b, e).unwrap().unwrap();
+        let line = matches!(curve.kind(), CurveKind::Line(_));
+        let ivl = edge::interval(&b, e).unwrap();
+        let ends = [
+            (edge::start_vertex(&b, e).unwrap(), ivl.min()),
+            (edge::end_vertex(&b, e).unwrap(), ivl.max()),
+        ];
+        for (v, t) in ends {
+            let at = vertex::point(&b, v.unwrap()).unwrap();
+            let d = curve.evaluate_point(&k, t).unwrap().distance(at);
+            if d >= if line { 1e-9 } else { 1e-8 } {
+                off.push(format!("{e:?} (line {line}) {d:e} from {at:?}"));
+            }
         }
     }
+    assert!(off.is_empty(), "{}", off.join("\n"));
 }
