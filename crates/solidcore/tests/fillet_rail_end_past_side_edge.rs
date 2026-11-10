@@ -17,6 +17,7 @@
 )] // test helpers
 use solidcore::blend::fillet_executive::api::fillet_edges;
 use solidcore::boolean::api_brep::boolean_union;
+use solidcore::curve::curve::CurveKind;
 use solidcore::kernel::UpstreamFixes;
 use solidcore::math::Point3;
 use solidcore::primitive::api_primitives::create_box;
@@ -124,5 +125,57 @@ fn the_rounds_end_crosses_the_seam_where_it_lies() {
             nearest(crossing)
         );
         assert!(nearest(old_end) > 1e-9, "{old_end:?}: {}", nearest(old_end));
+    }
+}
+
+/// The edges at the crossing end on it: put there, the vertex takes the edges that ended at the
+/// seam's old end with it (Knoten_laminiert's straight seam edges ended 1.4e-5 past their vertex,
+/// and a sketch projecting one drew it so, where Fusion's line ends on the vertex).
+#[test]
+fn the_edges_at_the_crossing_end_on_it() {
+    let mut k = Kernel::default();
+    k.fixes = UpstreamFixes::all();
+    k.fixes.fillet_refuse_rounds_breaking_through = false;
+    k.fixes.fillet_round_ends_on_outline = false;
+    let plate = create_box(&mut k, Point3::new(0.0, 0.0, 0.0), 30.0, 20.0, 1.0).unwrap();
+    let wall = create_box(&mut k, Point3::new(10.0, 0.0, 0.0), 20.0, 20.0, 6.0).unwrap();
+    let mut b = boolean_union(&mut k, plate, wall).unwrap();
+    let valley = edge_between(
+        &b,
+        Point3::new(10.0, 0.0, 1.0),
+        Point3::new(10.0, 20.0, 1.0),
+    );
+    fillet_edges(&mut k, &mut b, &[valley], 2.0, 1, 1, 1.0).unwrap();
+    let r = 8.01;
+    let corners = [
+        edge_between(&b, Point3::new(0.0, 0.0, 0.0), Point3::new(0.0, 0.0, 1.0)),
+        edge_between(&b, Point3::new(0.0, 20.0, 0.0), Point3::new(0.0, 20.0, 1.0)),
+    ];
+    fillet_edges(&mut k, &mut b, &corners, r, 1, 1, 1.0).unwrap();
+    let dy = r - (r * r - (r - 8.0) * (r - 8.0)).sqrt();
+    for crossing in [Point3::new(8.0, dy, 1.0), Point3::new(8.0, 20.0 - dy, 1.0)] {
+        let v = p1::vertices(&b, None)
+            .unwrap()
+            .into_iter()
+            .find(|&v| vertex::point(&b, v).unwrap().distance(crossing) < 1e-9)
+            .expect("the crossing's vertex");
+        let at = vertex::point(&b, v).unwrap();
+        for e in vertex::edges(&b, v, None).unwrap() {
+            let ivl = edge::interval(&b, e).unwrap();
+            let t = if edge::start_vertex(&b, e).unwrap() == Some(v) {
+                ivl.min()
+            } else {
+                ivl.max()
+            };
+            let curve = edge::curve(&b, e).unwrap().unwrap();
+            let end = curve.evaluate_point(&k, t).unwrap();
+            // A line ends on the vertex; a fitted curve (the round's) as near as it comes to it.
+            let line = matches!(curve.kind(), CurveKind::Line(_));
+            assert!(
+                end.distance(at) < if line { 1e-9 } else { 1e-8 },
+                "{e:?} ends {} from {at:?}",
+                end.distance(at)
+            );
+        }
     }
 }
