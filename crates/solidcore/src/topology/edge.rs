@@ -2072,8 +2072,19 @@ pub fn is_topological(
         }
     }
 
+    // Two faces on one B-spline surface value (a face a coincident tool's edge was
+    // imprinted on: each part keeps the surface, with or without the kind derived from
+    // `SmBSplineSurface` it had) are on the same surface as one face on both sides is.
+    // Upstream knows a surface by its address, so the parts never rejoin.
+    let same_value = || {
+        fn nurb(s: &Surface) -> Option<&crate::nurbs::srf_basic::Surface> {
+            crate::topology::brep::p3::as_bspline_surface(s).and_then(|s| s.gw_nurb())
+        }
+        nurb(&surf1).is_some() && nurb(&surf1) == nurb(&surf2)
+    };
+
     // when edge is connected to same surface on both sides - it's topological
-    if same_surf {
+    if same_surf || same_value() {
         out.surf_to_keep = Some(face1);
         out.dist_between = 0.0;
         out.merged_face_domain =
