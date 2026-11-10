@@ -2072,19 +2072,8 @@ pub fn is_topological(
         }
     }
 
-    // Two faces on one B-spline surface value (a face a coincident tool's edge was
-    // imprinted on: each part keeps the surface, with or without the kind derived from
-    // `SmBSplineSurface` it had) are on the same surface as one face on both sides is.
-    // Upstream knows a surface by its address, so the parts never rejoin.
-    let same_value = || {
-        fn nurb(s: &Surface) -> Option<&crate::nurbs::srf_basic::Surface> {
-            crate::topology::brep::p3::as_bspline_surface(s).and_then(|s| s.gw_nurb())
-        }
-        nurb(&surf1).is_some() && nurb(&surf1) == nurb(&surf2)
-    };
-
     // when edge is connected to same surface on both sides - it's topological
-    if same_surf || same_value() {
+    if same_surf {
         out.surf_to_keep = Some(face1);
         out.dist_between = 0.0;
         out.merged_face_domain =
@@ -2095,10 +2084,17 @@ pub fn is_topological(
             * (0.5 * face2::tolerance(b, face1)?).min(0.5 * face2::tolerance(b, face2_)?);
 
         // Do this only for Analytic surfaces, because they are extendable.
-        if !(surf1.is_analytic()? || surf1.is_planar(k, approx_tol)?.is_planar) {
+        // A plain B-spline the kernel takes for an analytic surface is one too: a split
+        // gives the part it splits off the analytic copy (`MakeEdgeInFaceWithVU`) and
+        // leaves the rest the plain surface it was read with, and upstream, whose bodies
+        // are analytic throughout, never meets the pair.
+        let analytic = |s: &Surface| -> Result<bool> {
+            Ok(s.is_analytic()? || s.copy_and_add_analytics(k)?.is_analytic()?)
+        };
+        if !(analytic(&surf1)? || surf1.is_planar(k, approx_tol)?.is_planar) {
             return Ok(out);
         }
-        if !(surf2.is_analytic()? || surf2.is_planar(k, approx_tol)?.is_planar) {
+        if !(analytic(&surf2)? || surf2.is_planar(k, approx_tol)?.is_planar) {
             return Ok(out);
         }
 
