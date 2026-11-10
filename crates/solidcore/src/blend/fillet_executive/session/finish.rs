@@ -977,7 +977,13 @@ impl FilletSession<'_> {
         );
         let cleanup = super::original_merge::destroy_tags(&mut self.objects, &tags);
         result.and(cleanup)?;
-        place_rolled_crossings(k, self.objects.target, &self.objects.pseudo)
+        let crossings = rolled_crossings(&self.objects.pseudo);
+        FinishAccess(&mut self.objects).with_target_env(k, |k, b, env| {
+            for v in place_rolled_crossings(k, b, &crossings)? {
+                p1::update_vertex_edge_intervals(k, b, env, v)?;
+            }
+            Ok(())
+        })
     }
 }
 
@@ -986,28 +992,19 @@ impl FilletSession<'_> {
 /// the round, the end face and the next face. It lies within tolerance of the edge's old end
 /// (Knoten_laminiert's Fillet4: 1.4e-5), and the merge kept whichever of the two points its
 /// order met first. A body vertex within its tolerance of a crossing is put on the crossing
-/// where that point lies nearer all the vertex's faces than its own.
+/// where that point lies nearer all the vertex's faces than its own; the vertices moved are
+/// returned (their edges still end where the vertex was: `UpdateVertexEdgeIntervals` brings
+/// them to it).
 ///
 /// # Errors
 /// Those of the face-gap evaluations.
 fn place_rolled_crossings(
     k: &mut Kernel,
     target: &mut crate::topology::Brep,
-    pseudo: &FilletBrep,
-) -> Result<()> {
-    use crate::blend::fillet_geom::p1::FilletVertexType;
+    crossings: &[crate::math::Point3],
+) -> Result<Vec<VertexId>> {
     use crate::topology::{vertex, vertexuse};
-    let crossings: Vec<_> = pseudo
-        .brep()
-        .vertices()
-        .iter()
-        .filter(|(v, _)| {
-            pseudo.fillet_vertex(*v).is_ok_and(|f| {
-                f.is_processed() && f.fillet_vertex_type() == FilletVertexType::FilletXEdgeuse
-            })
-        })
-        .map(|(_, r)| r.point)
-        .collect();
+    let mut moved = Vec::new();
     let face_gap = |k: &Kernel, b: &mut crate::topology::Brep, v: VertexId| -> Result<f64> {
         let mut most = 0.0f64;
         for vu in vertex::vertexuses(b, v)? {
@@ -1019,7 +1016,7 @@ fn place_rolled_crossings(
         }
         Ok(most)
     };
-    for p in crossings {
+    for &p in crossings {
         let mut near: Option<(f64, VertexId)> = None;
         for v in p1::vertices(target, None)? {
             let d = vertex::point(target, v)?.distance(p);
@@ -1037,13 +1034,32 @@ fn place_rolled_crossings(
         let at_crossing = face_gap(k, target, v)?;
         if at_crossing >= at_own {
             target.vertex_mut(v)?.point = own;
+        } else {
+            moved.push(v);
         }
         for vu in vertex::vertexuses(target, v)? {
             vertexuse::init_vertex_face_gap(target, vu)?;
             target.vertexuse_mut(vu)?.vertex_edge_gap.reset();
         }
     }
-    Ok(())
+    Ok(moved)
+}
+
+/// The fillet-built vertices where a round's end crosses a seam it rolls over
+/// ([`place_rolled_crossings`]).
+fn rolled_crossings(pseudo: &FilletBrep) -> Vec<crate::math::Point3> {
+    use crate::blend::fillet_geom::p1::FilletVertexType;
+    pseudo
+        .brep()
+        .vertices()
+        .iter()
+        .filter(|(v, _)| {
+            pseudo.fillet_vertex(*v).is_ok_and(|f| {
+                f.is_processed() && f.fillet_vertex_type() == FilletVertexType::FilletXEdgeuse
+            })
+        })
+        .map(|(_, r)| r.point)
+        .collect()
 }
 
 #[cfg(test)]
