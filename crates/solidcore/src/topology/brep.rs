@@ -40,6 +40,7 @@ pub mod planar_section;
 pub mod sheet;
 pub mod validation;
 pub mod vertex_fans;
+pub mod vertices_on_faces;
 
 // Supported public paths; numbered modules are implementation partitions.
 pub use p1::{create_parallel_projection_curves, edges, faces, regions, ParallelProjectionOptions};

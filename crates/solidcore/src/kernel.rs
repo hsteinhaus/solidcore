@@ -453,6 +453,13 @@ pub struct UpstreamFixes {
     pub thicken_planar_side_walls: bool,
     /// A volumetric Boolean removes the zero-area loops a contact curve inside a face leaves, and splits shells joined only through them (WR-360, #746).
     pub remove_slit_loops_where_solids_touch: bool,
+    /// Not upstream: a volumetric Boolean puts each vertex of its result that lies within its
+    /// tolerance of the seam of a periodic face it bounds exactly onto that seam, its edges'
+    /// ends following ([`crate::topology::brep::vertices_on_faces::put_vertices_on_seams`]).
+    /// Upstream leaves it where the operands' boundaries met, off the seam where a face of one
+    /// touches the other's along it (`SmFace` test #36, `Face Near missing Seam`; its
+    /// `Fix_BadGaps` was never built).
+    pub boolean_vertices_on_seams: bool,
     /// Regularize non-merged, in-place whole-body translational sweeps (#1937):
     /// squeeze newly swept faces degenerate at one quarter of the body tolerance,
     /// and remove isolated open-edge inner slit loops. Existing Euler operations

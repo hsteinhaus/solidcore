@@ -1794,6 +1794,31 @@ fn manifold_boolean_translated(
             removed?;
         }
     }
+    // Not upstream (opt-in, `Kernel::fixes.boolean_vertices_on_seams`): the result's vertices
+    // within their tolerance of a periodic face's seam are put on it (`SmFace` test #36).
+    if kernels.primary.fixes.boolean_vertices_on_seams
+        && matches!(
+            operation,
+            BooleanOperation::Union | BooleanOperation::Intersection | BooleanOperation::Difference
+        )
+    {
+        if let Some(a) = primary.as_mut() {
+            let mut records = crate::topology::topology::NotifyRecords::new();
+            let mut env = edge::NotifyEnv {
+                records: &mut records,
+                attributes: &mut *attributes,
+                context: None,
+                key_of: &crate::topology::loopuse::notify_ref,
+            };
+            let vertices = crate::topology::brep::p1::vertices(a, None)?;
+            crate::topology::brep::vertices_on_faces::put_vertices_on_seams(
+                kernels.primary,
+                a,
+                &mut env,
+                &vertices,
+            )?;
+        }
+    }
     finish_boolean(
         kernels,
         primary,
