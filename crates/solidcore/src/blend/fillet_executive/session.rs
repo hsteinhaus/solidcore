@@ -94,6 +94,7 @@ use crate::topology::{Brep, EdgeId, EdgeuseId, FaceId, VertexId};
 pub mod ball_regular;
 pub mod band_cuts;
 mod blend_face_log;
+mod blend_vertices;
 mod classification;
 mod cliff_overflow;
 mod concave_nxn;

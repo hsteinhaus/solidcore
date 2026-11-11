@@ -87,7 +87,7 @@ impl FilletSession<'_> {
     /// Before the merge, with the log on: mark each made face of the intermediate body
     /// with its kind (`SM_AB_COPY`, so the merge's copies carry it).
     pub(super) fn mark_blend_faces(&mut self, k: &Kernel) -> Result<()> {
-        if k.blend_face_log.is_none() {
+        if !marks_blend_faces(k) {
             return Ok(());
         }
         for (face, kind) in self.made_intermediate_faces()? {
@@ -121,7 +121,7 @@ impl FilletSession<'_> {
         k: &Kernel,
         face: FaceId,
     ) -> Result<Option<BlendFaceKind>> {
-        if k.blend_face_log.is_none() {
+        if !marks_blend_faces(k) {
             return Ok(None);
         }
         let key = self.target_identity(EntityRef::Face(face)).key;
@@ -158,7 +158,7 @@ impl FilletSession<'_> {
         face: FaceId,
         kind: BlendFaceKind,
     ) -> Result<()> {
-        if k.blend_face_log.is_none() {
+        if !marks_blend_faces(k) {
             return Ok(());
         }
         let key = self.target_identity(EntityRef::Face(face)).key;
@@ -187,9 +187,9 @@ impl FilletSession<'_> {
     /// to the log as this session's entry, and every mark is deleted. Runs whether
     /// filleting succeeded or not (only a success's entry is kept).
     pub(super) fn take_blend_faces(&mut self, k: &mut Kernel, succeeded: bool) -> Result<()> {
-        let Some(log) = k.blend_face_log.as_mut() else {
+        if !marks_blend_faces(k) {
             return Ok(());
-        };
+        }
         let mut made = Vec::new();
         let mut found = Vec::new();
         for face in p1::faces(self.objects.target, None)? {
@@ -222,9 +222,16 @@ impl FilletSession<'_> {
                 self.objects.attributes.destroy(handle)?;
             }
         }
-        if succeeded {
+        if let Some(log) = k.blend_face_log.as_mut().filter(|_| succeeded) {
             log.sessions.push(made);
         }
         Ok(())
     }
+}
+
+/// Whether the session marks its blend faces: for the blend face log, or (not upstream) for
+/// `fixes.fillet_blend_vertices_on_their_faces`, which finds the blend faces' vertices by
+/// them. The marks go after filleting either way ([`FilletSession::take_blend_faces`]).
+fn marks_blend_faces(k: &Kernel) -> bool {
+    k.blend_face_log.is_some() || k.fixes.fillet_blend_vertices_on_their_faces
 }

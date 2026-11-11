@@ -130,7 +130,7 @@ impl FinishAccess<'_, '_> {
 
     /// `body` on the target with a notification environment over the session's records
     /// and attributes under the target's issued identities.
-    fn with_target_env<T>(
+    pub(super) fn with_target_env<T>(
         &mut self,
         k: &mut Kernel,
         body: impl FnOnce(
@@ -632,6 +632,11 @@ impl FilletSession<'_> {
         let status = self.typed_filleting(k, status);
         let joined = self.join_blended_vertex_fans();
         match status {
+            // (not upstream) the blend faces' vertices onto their faces, while the faces
+            // are still marked as blends
+            Ok(()) if k.fixes.fillet_blend_vertices_on_their_faces => {
+                joined.and_then(|()| self.put_blend_vertices_on_their_faces(k))
+            }
             Ok(()) => joined,
             Err(e) => Err(e),
         }

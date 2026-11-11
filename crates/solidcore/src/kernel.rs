@@ -352,6 +352,13 @@ pub struct UpstreamFixes {
     pub fillet_refuse_overlapping_bands: bool,
     /// `DoFillet` refuses a filleted target that is not a closed manifold solid (an edge that is not `SmEdge::IsManifold`) with `SM_FILERR_BAD_MERGE`, where upstream returns success (WR-212, #422); the public wrappers (`fillet_edges`, `fillet_edges_per_edge`, `variable_radius_fillet`) then put the caller's body back as it was before the call.
     pub fillet_refuse_non_manifold_result: bool,
+    /// Not upstream: after a fillet, each vertex of its blend faces where three faces meet
+    /// is put where their three surfaces meet (`Surface::local_surface_surface_intersect`
+    /// from its drops onto them), when that is nearer all three than the vertex is, and its
+    /// edges' ends follow ([`crate::topology::brep::p1::update_vertex_edge_intervals`]).
+    /// Upstream leaves the vertex at the end of the fitted rail it was made from, off a face
+    /// it lies on by up to the fit (`SmVertex` test #1, `Bad Vertex Gap`).
+    pub fillet_blend_vertices_on_their_faces: bool,
     /// The fillet executive refuses two rounds on edges of one face whose rails cross on it (no room between them), before the target is edited, where upstream builds an open body (WR-460, #1073). A closest-point query on an edge with no solution finds no crossing there and is not a failure (#2050).
     pub fillet_refuse_crossing_rails: bool,
     /// The vertex overload of `SmFilletErrorInfo::NoteError` records the vertex, its location, the fillet status, the error code and the comment, as the edge overload does, and `CreateFilletCorners` notes a vertex no corner type handles as `SM_FILERR_CORNER_UNSUPPORTED` with "Corner case not implemented" (WR-513, #1469; tangency-labs/smlib@a73cf5e). The pinned overload records nothing, so the failure reached the caller as the generic 1001 with no reason. Off by default (pinned behaviour). Diagnostics only: the pending vertex entry and the operation's result are unchanged, so this does not make an unsupported corner succeed. The whole-operation wrappers (e.g. `fillet_edges`) drop their session and return only the later failure; the retained note is readable through [`crate::blend::fillet_executive::session::FilletSession::error_info`]. The C API's `SMLIB_ERR_CORNER_UNSUPPORTED` (-1111) is not mapped here.
