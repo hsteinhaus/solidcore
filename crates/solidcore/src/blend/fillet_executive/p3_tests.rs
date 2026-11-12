@@ -751,6 +751,7 @@ fn state() -> FilletExecutive<Handle> {
         blend_curve_at_thirds: false,
         mark_corner_patches: false,
         cliff_overflow: false,
+        cliff_adds_material: false,
         open_ends: Vec::new(),
         overflow_first: false,
         classify_only: false,

@@ -210,9 +210,16 @@ pub fn surface_plane_curve(
     // the curve is held to a tenth of `tol` of the exact one: a blend by its definition
     // whose net's bound is within that evaluates as its net (#2510)
     let _scope = NetScope::within(k, 0.1 * tol);
-    // the plane: O + (u - u0) Pu + (v - v0) Pv about a point (u0, v0) of its own domain (a
-    // plane's parameters need not hold (0, 0), where its evaluation would be clamped)
-    let at = plane.natural_uv_domain_with_nurb(k)?.min();
+    // the plane: O + (u - u0) Pu + (v - v0) Pv about a point (u0, v0) of its own domain: (0, 0)
+    // where it holds it, else its lower corner (a plane's parameters need not hold (0, 0),
+    // where its evaluation would be clamped)
+    let dom = plane.natural_uv_domain_with_nurb(k)?;
+    let at = if dom.min().x <= 0.0 && 0.0 <= dom.max().x && dom.min().y <= 0.0 && 0.0 <= dom.max().y
+    {
+        Point2::new(0.0, 0.0)
+    } else {
+        dom.min()
+    };
     let (origin, plane_u, plane_v) = first_derivs(k, plane, at)?;
     let normal = plane_u.cross(plane_v).unitize()?;
     let (g11, g12, g22) = (

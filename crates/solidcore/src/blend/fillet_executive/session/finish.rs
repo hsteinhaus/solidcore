@@ -803,7 +803,10 @@ impl FilletSession<'_> {
                         && k.fixes.fillet_overflow_trim_at_creases
                         && k.fixes.fillet_round_ends_at_tangent_continuation
                 } else {
-                    session.executive.cliff_overflow && k.fixes.fillet_overflow_trim_at_creases
+                    // (not one that adds material: its region is united, cut at the cliffs)
+                    session.executive.cliff_overflow
+                        && !session.executive.cliff_adds_material
+                        && k.fixes.fillet_overflow_trim_at_creases
                 };
             if trimmed {
                 let result = session.trim_at_creases(k);

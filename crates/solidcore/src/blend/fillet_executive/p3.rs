@@ -653,6 +653,9 @@ pub struct FilletExecutive<O> {
     /// removes is subtracted from the target. Set only with
     /// `fixes.fillet_cliff_overflow`.
     pub cliff_overflow: bool,
+    /// The cliff overflow adds material (not upstream: `fixes.fillet_concave_cliff_overflow`):
+    /// its region is united with the target, cut at the cliffs.
+    pub cliff_adds_material: bool,
     /// `m_vOpenEnds` (the fork's, WR-631): the fillet's ends the Nx1 corner there left
     /// uncut, in a cliff overflow.
     pub open_ends: Vec<OpenEnd<O>>,
@@ -3023,6 +3026,32 @@ impl<O: ClassObject + SolutionObject + Ord> FilletExecutive<O> {
             return Err(failure());
         }
         if overflow {
+            // not the fork's (`fixes.fillet_concave_cliff_overflow`): every blend concave, an
+            // overflow that adds material is built as a cliff overflow that unites its region
+            let all_concave = {
+                let mut all = true;
+                let mut index = 0;
+                while let Some(solver) = self.solvers.get(index).copied() {
+                    index += 1;
+                    if !access.geometry_blend_adds_material(k, solver)? {
+                        all = false;
+                        break;
+                    }
+                }
+                all
+            };
+            if concave_overflow
+                && k.fixes.fillet_concave_cliff_overflow
+                && k.fixes.fillet_cliff_overflow
+                && all_concave
+                && !round_into_material
+                && !rolls_over
+                && !self.options.global_merge
+            {
+                self.cliff_overflow = true;
+                self.cliff_adds_material = true;
+                return Ok(());
+            }
             let why = if concave_overflow {
                 Some((NoRoomReason::ConcaveOverflow, "Fillet Error: a rail leaves the face it rolls on (the blend is larger than the faces allow, and adds material)"))
             } else if round_into_material {

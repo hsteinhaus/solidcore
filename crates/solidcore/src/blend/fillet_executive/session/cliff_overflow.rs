@@ -510,6 +510,34 @@ impl FilletSession<'_> {
             }
         }
 
+        // not the fork's (`fixes.fillet_concave_cliff_overflow`): a region the blends add is cut
+        // at the cliffs their rails run past, and united with the target
+        let adds = self.executive.cliff_adds_material;
+        if adds {
+            let mut rolled = Vec::new();
+            for &e in &blended_edges {
+                for f in edge::faces(self.objects.target, e, None)? {
+                    if !rolled.contains(&f) {
+                        rolled.push(f);
+                    }
+                }
+            }
+            let clipped = crate::blend::fillet_cliff_overflow::clip_beyond_cliffs(
+                k,
+                region,
+                self.objects.target,
+                &rolled,
+                tol,
+                &mut note,
+            );
+            region = self.noted(note.take(), clipped)?;
+        }
+        let operation = if adds {
+            BooleanOperation::Union
+        } else {
+            BooleanOperation::Difference
+        };
+
         // the region from the target, by the Boolean (the merge modifies the target in
         // place; the region is deleted after)
         // (a snapshot, not a clone: the target put back must still own its geometry,
@@ -527,7 +555,7 @@ impl FilletSession<'_> {
         )?;
         let mut taken: Brep = std::mem::take(&mut *self.objects.target);
         taken.set_attributes(carried);
-        match boolean(k, taken, region, BooleanOperation::Difference) {
+        match boolean(k, taken, region, operation) {
             Ok(outcome) => {
                 // Not the fork's (WR-631 addendum): the subtraction from a manifold solid
                 // must leave one. The Boolean can succeed with an empty or open body (a

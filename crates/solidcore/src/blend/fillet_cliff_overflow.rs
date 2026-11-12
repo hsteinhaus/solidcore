@@ -1327,6 +1327,34 @@ fn face_of_loop(
             uvs.push(dropped.result_uv);
         }
     }
+    // (not the fork's, `fixes.fillet_concave_cliff_overflow`) on a periodic surface the points
+    // in one period along the loop, each moved by whole periods to the copy nearest the one
+    // before (a point on the seam drops onto either bound)
+    if k.fixes.fillet_concave_cliff_overflow {
+        use crate::nurbs::b_spline_surface::SurfParamType;
+        let mut period = [0.0f64; 2];
+        for (d, (param, width)) in [
+            (SurfParamType::U, domain.max().x - domain.min().x),
+            (SurfParamType::V, domain.max().y - domain.min().y),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if width > 0.0 && matches!(surface.is_periodic(k, &domain, param), Ok(true)) {
+                period[d] = width;
+            }
+        }
+        for i in 1..uvs.len() {
+            let Some(&p) = uvs.get(i - 1) else { continue };
+            let Some(q) = uvs.get_mut(i) else { continue };
+            if period[0] > 0.0 {
+                q.x -= ((q.x - p.x) / period[0]).round() * period[0];
+            }
+            if period[1] > 0.0 {
+                q.y -= ((q.y - p.y) / period[1]).round() * period[1];
+            }
+        }
+    }
     let mut area = 0.0;
     for (i, a) in uvs.iter().enumerate() {
         let Some(b) = uvs.get((i + 1) % uvs.len()) else {
@@ -1369,7 +1397,103 @@ fn face_of_loop(
             env,
         )
     })?;
-    made.face.ok_or_else(|| SolidError::null_pointer(OP))
+    let face = made.face.ok_or_else(|| SolidError::null_pointer(OP))?;
+    if k.fixes.fillet_concave_cliff_overflow {
+        loops_in_one_period(k, region, face)?;
+    }
+    Ok(face)
+}
+
+/// Not the fork's (`fixes.fillet_concave_cliff_overflow`): each loop of face `f` on a
+/// periodic surface in one period: its edge uses' UV trim curves (made where missing), each
+/// moved by whole periods to the copy nearest the one before it along the loop (a curve on a
+/// seam, which the drop puts on either bound, meets its neighbours). A move is a translation
+/// in the surface's parameters: exact.
+///
+/// # Errors
+/// Those of the topology reads, the UV trim curves and the transforms.
+pub(crate) fn loops_in_one_period(k: &Kernel, b: &mut Brep, f: FaceId) -> Result<()> {
+    use crate::geom::axis2_placement::Axis2Placement;
+    use crate::nurbs::b_spline_surface::SurfParamType;
+    use crate::topology::edgeuse::p1 as eu1;
+    use crate::topology::edgeuse::p3::get_or_create_uv_trim_curve;
+    let surface = face::p2::surface(b, f)?.ok_or_else(|| SolidError::null_pointer(OP))?;
+    let dom = surface.natural_uv_domain_with_nurb(k)?;
+    let mut period = [0.0f64; 2];
+    for (d, (param, width)) in [
+        (SurfParamType::U, dom.max().x - dom.min().x),
+        (SurfParamType::V, dom.max().y - dom.min().y),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if width > 0.0 && matches!(surface.is_periodic(k, &dom, param), Ok(true)) {
+            period[d] = width;
+        }
+    }
+    if period == [0.0, 0.0] {
+        return Ok(());
+    }
+    let Some(up) = face::p2::upward_faceuse(b, f)? else {
+        return Ok(());
+    };
+    for lu in eu1::faceuse_loopuses(b, up, false, None)? {
+        let eus = crate::topology::loopuse::edgeuses(b, lu, None, None)?;
+        let mut prev: Option<[Point2; 2]> = None;
+        for eu in eus {
+            get_or_create_uv_trim_curve(k, b, eu, false, false, true)?.status?;
+            let Some(curve) = b.edgeuse(eu)?.uv_trim_curve.clone() else {
+                continue;
+            };
+            let ivl = curve.natural_interval();
+            let a = curve.evaluate_point(k, ivl.min())?;
+            let z = curve.evaluate_point(k, ivl.max())?;
+            let ends = [Point2::new(a.x, a.y), Point2::new(z.x, z.y)];
+            let Some(before) = prev else {
+                prev = Some(ends);
+                continue;
+            };
+            // the whole periods that bring the curve nearest the one before
+            let gap = |dx: f64, dy: f64| {
+                let mut best = BIG_DOUBLE;
+                for p in before {
+                    for q in ends {
+                        best =
+                            best.min(((q.x + dx - p.x).powi(2) + (q.y + dy - p.y).powi(2)).sqrt());
+                    }
+                }
+                best
+            };
+            let (mut dx, mut dy, mut best) = (0.0, 0.0, gap(0.0, 0.0));
+            for i in -1i32..=1 {
+                for j in -1i32..=1 {
+                    let (sx, sy) = (f64::from(i) * period[0], f64::from(j) * period[1]);
+                    let g = gap(sx, sy);
+                    if g < best - EFF_ZERO_SQRT {
+                        (dx, dy, best) = (sx, sy, g);
+                    }
+                }
+            }
+            if dx != 0.0 || dy != 0.0 {
+                let mut moved = curve;
+                let mut shift = Axis2Placement::default();
+                shift.set_canonical(
+                    Point3::new(dx, dy, 0.0),
+                    Vec3::new(1.0, 0.0, 0.0),
+                    Vec3::new(0.0, 1.0, 0.0),
+                )?;
+                moved.transform(k, &shift, None)?;
+                b.edgeuse_mut(eu)?.uv_trim_curve = Some(moved);
+                prev = Some([
+                    Point2::new(ends[0].x + dx, ends[0].y + dy),
+                    Point2::new(ends[1].x + dx, ends[1].y + dy),
+                ]);
+            } else {
+                prev = Some(ends);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The fork's `SmFilletExecutive::CloseRemovalRegion`: close `region`, the sheet of fillet
@@ -2140,4 +2264,212 @@ pub fn section_edge(
         }
     }
     Ok(found)
+}
+
+/// Not the fork's (`fixes.fillet_concave_cliff_overflow`): the region a concave blend adds,
+/// built on its faces' continuations ([`close_removal_region`]), cut at the cliffs its rails
+/// run past, so what it adds stays on the body's side of them (a round between a plate and a
+/// tower standing at the plate's rim is cut flush with the wall below the rim; one running
+/// over a hole in the plate is cut by the hole's wall).
+///
+/// A cliff is a face beside a face the blends roll on (`rolled`), across an edge of it that
+/// runs through the region's box, whose surface continued the region lies on both sides of.
+/// Its air side is the side of its surface's normal at an inner point off which the target
+/// classifies outside. Beyond a planar cliff the region is cut by a box on its plane; inside
+/// a cylindrical one with the air inside (a hole), by the cylinder solid. A cliff of any other
+/// kind is refused (`NotExact`).
+///
+/// # Errors
+/// The refusal as `SM_ERR`, written to `note`; those of the queries and the Booleans.
+#[allow(clippy::too_many_lines)]
+pub fn clip_beyond_cliffs(
+    k: &mut Kernel,
+    region: Brep,
+    target: &Brep,
+    rolled: &[FaceId],
+    tol: f64,
+    note: &mut Option<Refusal>,
+) -> Result<Brep> {
+    use crate::boolean::api_brep::boolean;
+    use crate::geom::a_object::BooleanOperation;
+    use crate::geom::axis2_placement::Axis2Placement;
+    use crate::primitive::api_primitives::{create_box_on, create_cylinder_on};
+    use crate::query::api_queries::{brep_bounding_box, face_internal_point};
+    use crate::query::brep::{evaluate_surface_normal, BrepClassifier};
+
+    let mut region = region;
+    let ext = brep_bounding_box(k, &region, true)?;
+    let (lo, hi) = (ext.min(), ext.max());
+    let margin = 10.0 * tol + 1e-3 * (hi - lo).length();
+    let inside = |p: Point3| {
+        p.x >= lo.x - margin
+            && p.x <= hi.x + margin
+            && p.y >= lo.y - margin
+            && p.y <= hi.y + margin
+            && p.z >= lo.z - margin
+            && p.z <= hi.z + margin
+    };
+    let corners: Vec<Point3> = (0..8)
+        .map(|i| {
+            Point3::new(
+                if i & 1 == 0 { lo.x } else { hi.x },
+                if i & 2 == 0 { lo.y } else { hi.y },
+                if i & 4 == 0 { lo.z } else { hi.z },
+            )
+        })
+        .collect();
+
+    // the candidates: faces across an edge of a rolled face running through the region's box
+    let mut cliffs: Vec<FaceId> = Vec::new();
+    for &f in rolled {
+        for e in face::p4::edges(target, f, None, false, None)? {
+            let others: Vec<FaceId> = edge::faces(target, e, None)?
+                .into_iter()
+                .filter(|g| *g != f && !rolled.contains(g) && !cliffs.contains(g))
+                .collect();
+            if others.is_empty() {
+                continue;
+            }
+            let c = edge_curve(k, target, e)?;
+            let ivl = c.natural_interval();
+            let mut near = false;
+            for i in 0..=16 {
+                let p = c.evaluate_point(k, ivl.evaluate(f64::from(i) / 16.0))?;
+                if inside(p) {
+                    near = true;
+                    break;
+                }
+            }
+            if near {
+                cliffs.extend(others);
+            }
+        }
+    }
+    if cliffs.is_empty() {
+        return Ok(region);
+    }
+
+    // the region's points: its vertices and the middles of its edges
+    let mut points: Vec<Point3> = Vec::new();
+    for v in crate::topology::brep::p1::vertices(&region, None)? {
+        points.push(region.vertex(v)?.point);
+    }
+    for e in crate::topology::brep::p1::edges(&region, None)? {
+        let c = edge_curve(k, &region, e)?;
+        let ivl = c.natural_interval();
+        points.push(c.evaluate_point(k, ivl.evaluate(0.5))?);
+    }
+
+    let mut copy = crate::topology::brep::p3::brep_copy(k, target)?;
+    let classified = crate::topology::brep::p3::brep_copy(k, target)?;
+    let mut classifier = BrepClassifier::of_brep(&classified);
+    let refuse = |note: &mut Option<Refusal>, comment: &'static str| {
+        *note = Some(Refusal {
+            code: FilletErrorType::NotExact,
+            reason: Some(NoRoomReason::ConcaveOverflow),
+            comment,
+        });
+        SolidError::sm_err(OP)
+    };
+    for g in cliffs {
+        let surface = face::p2::surface(target, g)?
+            .ok_or_else(|| SolidError::null_pointer(OP))?
+            .clone();
+        // the air side: the normal's side off which the target classifies outside
+        let ip = face_internal_point(k, &mut copy, g)?;
+        let dom = surface.natural_uv_domain_with_nurb(k)?;
+        let d = surface.drop_point::<NoObject>(k, ip, &dom, &DropPointOptions::default())?;
+        let n = evaluate_surface_normal(k, Some(&surface), d.result_uv)?;
+        let n = n * (1.0 / n.length());
+        let pc = classifier.point_3d_classify(k, ip + n * (100.0 * tol), tol, true)?;
+        let out = match (pc.point_class(), pc.object()) {
+            (PointClassType::Region, Some(EntityRef::Region(r))) => {
+                classifier.brep().region(r)?.is_void() == 1
+            }
+            _ => {
+                return Err(refuse(
+                    note,
+                    "Fillet Error: a concave cliff overflow's cliff has no clear air side",
+                ))
+            }
+        };
+        let air = if out { n } else { n * -1.0 };
+        if let Some(frame) = plane_of(k, &surface)? {
+            // the region on both sides of the plane: cut by a box on its air side
+            let s: Vec<f64> = points
+                .iter()
+                .map(|p| (*p - frame.origin).dot(air))
+                .collect();
+            if !(s.iter().any(|x| *x > tol) && s.iter().any(|x| *x < -tol)) {
+                continue;
+            }
+            let x = frame.x;
+            let mut y = frame.y;
+            if x.cross(y).dot(air) < 0.0 {
+                y = y * -1.0;
+            }
+            let (mut u0, mut u1, mut v0, mut v1, mut w1) =
+                (BIG_DOUBLE, -BIG_DOUBLE, BIG_DOUBLE, -BIG_DOUBLE, 0.0f64);
+            for c in &corners {
+                let r = *c - frame.origin;
+                u0 = u0.min(r.dot(x));
+                u1 = u1.max(r.dot(x));
+                v0 = v0.min(r.dot(y));
+                v1 = v1.max(r.dot(y));
+                w1 = w1.max(r.dot(air));
+            }
+            let mut place = Axis2Placement::default();
+            place.set_canonical(frame.origin + x * (u0 - margin) + y * (v0 - margin), x, y)?;
+            let air_solid = create_box_on(
+                k,
+                &place,
+                u1 - u0 + 2.0 * margin,
+                v1 - v0 + 2.0 * margin,
+                w1 + margin,
+            )?;
+            region = boolean(k, region, air_solid, BooleanOperation::Difference)?.result;
+        } else if let SurfaceKind::Cone(cone) = surface.kind() {
+            if !cone.is_cylinder_class() {
+                return Err(refuse(
+                    note,
+                    "Fillet Error: a concave cliff overflow runs past a conical cliff",
+                ));
+            }
+            let axis = cone.rev().position();
+            let (o, z) = (axis.origin(), axis.z_axis());
+            let radial = |p: Point3| {
+                let r = p - o;
+                (r - z * r.dot(z)).length()
+            };
+            let radius = radial(ip);
+            // a hole's wall: the air inside, toward the axis
+            let r_ip = ip - o;
+            if (z * r_ip.dot(z) - r_ip).dot(air) <= 0.0 {
+                return Err(refuse(
+                    note,
+                    "Fillet Error: a concave cliff overflow runs past a convex cylindrical cliff",
+                ));
+            }
+            let s: Vec<f64> = points.iter().map(|p| radial(*p) - radius).collect();
+            if !(s.iter().any(|x| *x > tol) && s.iter().any(|x| *x < -tol)) {
+                continue;
+            }
+            let (mut t0, mut t1) = (BIG_DOUBLE, -BIG_DOUBLE);
+            for c in &corners {
+                let t = (*c - o).dot(z);
+                t0 = t0.min(t);
+                t1 = t1.max(t);
+            }
+            let mut place = Axis2Placement::default();
+            place.set_canonical(o + z * (t0 - margin), axis.x_axis(), axis.y_axis())?;
+            let air_solid = create_cylinder_on(k, &place, radius, t1 - t0 + 2.0 * margin)?;
+            region = boolean(k, region, air_solid, BooleanOperation::Difference)?.result;
+        } else {
+            return Err(refuse(
+                note,
+                "Fillet Error: a concave cliff overflow runs past a cliff neither planar nor cylindrical",
+            ));
+        }
+    }
+    Ok(region)
 }

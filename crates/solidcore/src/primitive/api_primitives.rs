@@ -215,6 +215,52 @@ pub fn create_box(
     Ok(brep)
 }
 
+/// Not upstream: [`create_box`] on `frame`, its lower left corner at the frame's origin and its
+/// sides along the frame's axes (`SmApiCreateBox` takes the world's).
+///
+/// # Errors
+///
+/// As [`create_box`].
+pub(crate) fn create_box_on(
+    k: &mut Kernel,
+    frame: &Axis2Placement,
+    length: f64,
+    width: f64,
+    height: f64,
+) -> Result<Brep> {
+    if !is_positive_dim(length) || !is_positive_dim(width) || !is_positive_dim(height) {
+        return Err(SolidError::invalid_input(OP_BOX, "non-positive size"));
+    }
+    let (mut pc, mut brep) = new_primitive(k)?;
+    pc.create_box(k, &mut brep, length, width, height, frame)?;
+    brep.refresh_cached_topology();
+    Ok(brep)
+}
+
+/// Not upstream: [`create_cylinder`] on `frame`, its base circle about the frame's origin and
+/// its axis along the frame's Z (`SmApiCreateCylinder` takes the world's).
+///
+/// # Errors
+///
+/// As [`create_cylinder`].
+pub(crate) fn create_cylinder_on(
+    k: &mut Kernel,
+    frame: &Axis2Placement,
+    radius: f64,
+    height: f64,
+) -> Result<Brep> {
+    if !is_positive_dim(radius) || !is_positive_dim(height) {
+        return Err(SolidError::invalid_input(
+            OP_CYLINDER_SOLID,
+            "non-positive radius or height",
+        ));
+    }
+    let (mut pc, mut brep) = new_primitive(k)?;
+    pc.create_cylinder(k, &mut brep, height, radius, frame)?;
+    brep.refresh_cached_topology();
+    Ok(brep)
+}
+
 /// The solid sphere of `radius` (negative: inside out) centred at `origin`, with poles
 /// (`SmApiCreateSphere`: `CreateSphere(radius, 0, 360, frame)`).
 ///
