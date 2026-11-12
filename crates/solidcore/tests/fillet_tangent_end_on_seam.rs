@@ -2,7 +2,7 @@
 //! `sm_TangentEndRib`): a round's end rib on a periodic end face runs within one period.
 //!
 //! SolidCraft's Pixracer_Basis before its Fillet2 (`data/pixracer_basis_before_fillet2.smb`):
-//! R0.15 on the four straight inner edges of the walls' top, each running on tangentially into
+//! R1.5 on the four straight inner edges of the walls' top, each running on tangentially into
 //! a corner cylinder (r 7, full turn, its seam on the wall's tangent line). Each round ends on
 //! that cylinder in a rib from the tangent end (on the seam, v = 0) to the other rail (v =
 //! 42.43, one period from -1.55): the rib's first guess crossed the whole cylinder and no
@@ -75,7 +75,7 @@ fn pixracer_fillet2_ends_on_the_corner_cylinders() {
     };
     let mut b = read(&mut k, INPUT);
     let edges: Vec<EdgeId> = EDGES.iter().map(|&p| pick(&k, &b, p)).collect();
-    fillet_edges(&mut k, &mut b, &edges, 0.15, 1, 1, 0.0).unwrap();
+    fillet_edges(&mut k, &mut b, &edges, 1.5, 1, 1, 0.0).unwrap();
     let lines = check_brep(&mut k, &mut b, CheckLevel::Level2)
         .unwrap()
         .lines();
