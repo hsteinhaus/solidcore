@@ -2324,6 +2324,39 @@ impl Ellipse {
         Ok(())
     }
 
+    /// Not upstream: the same ellipse run on from one end (`run_end` 1: its end, 0: its
+    /// start) to the angle of `point`, as [`Self::join_with`] runs it on to another piece of
+    /// it; unchanged when that angle lies within it already.
+    ///
+    /// # Errors
+    ///
+    /// Those of [`Self::make_nurb_owned`] and the notification.
+    pub fn run_on_to(
+        &mut self,
+        k: &Kernel,
+        run_end: u64,
+        point: Point3,
+        owner: Option<ObjectRef>,
+    ) -> Result<()> {
+        let orig_domain = self.anal_domain;
+        // the whole turn on from that end, to find the angle there
+        if run_end == u64::from(self.inside_out) {
+            let v = self.anal_domain.max() - 360.0;
+            self.anal_domain.add_value(v);
+        } else {
+            let v = self.anal_domain.min() + 360.0;
+            self.anal_domain.add_value(v);
+        }
+        let angle = self.step_inversion(k, point, false, 0.0).0;
+        self.anal_domain = orig_domain;
+        if orig_domain.contains_value(angle, EFF_ZERO) {
+            return Ok(());
+        }
+        self.anal_domain.add_value(angle);
+        ignore_status(self.make_nurb_owned(k, owner))?;
+        self.notify(k, NotifyOperation::PostEdit)
+    }
+
     /// Reverses the direction of the curve (`ReverseParameterization`): a missing NURB
     /// is made, the Y axis is negated (`SetCanonical`, status ignored), the STEP domain
     /// `[m, M]` becomes `[360 - M, 360 - m]` (status ignored) and the NURB is reversed

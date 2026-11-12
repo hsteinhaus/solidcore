@@ -63,6 +63,7 @@
 //! - No recursion.
 
 use crate::curve::curve::{Curve, CurveKind};
+use crate::curve::line::Line;
 use crate::error::{ignore_status, ignored, EntityRef, Result, SolidError};
 use crate::geom::extent1d::Extent1d;
 use crate::geom::extent2d::Extent2d;
@@ -77,6 +78,7 @@ use crate::nurbs::b_spline_curve_n_lib::TrimMode;
 use crate::nurbs::b_spline_surface::p1::SurfParamType;
 use crate::nurbs::b_spline_surface::BSplineSurface;
 use crate::nurbs::b_spline_surface_n_lib::p2::OrientType;
+use crate::surface::offset_surface::OffsetSurface;
 use crate::surface::plane::Plane;
 use crate::surface::surface::p3::set_out_of_bounds_enabled;
 use crate::surface::surface::{Surface, SurfaceKind};
@@ -591,6 +593,10 @@ impl FilletRemoval {
         tan_dom0.expand_relative(2.0);
         tan_dom1.expand_relative(2.0);
         end_dom.expand_relative(2.0);
+        // Not upstream: an analytic surface continued exactly over them.
+        let tan0 = continued_copy(k, b, self.tan_face(0)?, &tan_dom0, tan0)?;
+        let tan1 = continued_copy(k, b, self.tan_face(1)?, &tan_dom1, tan1)?;
+        let end_surf = continued_copy(k, b, self.end_face(which_end)?, &end_dom, end_surf)?;
 
         let c0 = self.corner(which_end, 0)?;
         let c1 = self.corner(which_end, 1)?;
@@ -694,6 +700,44 @@ impl FilletRemoval {
             }
         }
 
+        // Not upstream: an ellipse or circle side edge too short to reach the new corner (a
+        // wall's edge on a cylinder) runs on as the same curve when the corner lies on it
+        // (else upstream's fitted extension follows); nothing is fitted or joined to it.
+        if k.fixes.fillet_removal_continues_analytic_faces
+            && !(stat_ok && success && crv_dist <= tol)
+        {
+            if let Some(side) = side_edge {
+                if let CurveKind::Ellipse(ell) = ner(edge::curve(b, side)?)?.kind() {
+                    let mut longer = ell.copy(k)?;
+                    longer.run_on_to(k, u64::from(high_end), new_vtx_pt, None)?;
+                    let longer = Curve::from(longer);
+                    let ivl = longer.natural_interval();
+                    let guess = if high_end { ivl.max() } else { ivl.min() };
+                    let drop = longer.drop_point(
+                        k,
+                        &ivl,
+                        new_vtx_pt,
+                        None,
+                        tol * 10.0,
+                        Some(guess),
+                        SolverOperation::Minimize,
+                    );
+                    match drop {
+                        Ok(d) if d.success && d.distance <= tol => {
+                            stat_ok = true;
+                            success = true;
+                            crv_param = d.parameter;
+                            crv_dist = d.distance;
+                            self.corner_mut(which_end, which_side)?.new_side_curve = Some(longer);
+                        }
+                        Err(e) if e.is_unported_or_cancelled() => return Err(e),
+                        // the corner is off the side edge's curve: upstream's fitted extension
+                        _ => {}
+                    }
+                }
+            }
+        }
+
         // Not upstream (WR-606, exact only): a side edge too short to reach the new
         // corner runs on along its own line (its end span continued: the same line); a
         // curved one would need a fitted intersection.
@@ -765,10 +809,10 @@ impl FilletRemoval {
                 corner.new_side_edge_extension_3d = None;
             }
 
-            // Not upstream (WR-606, exact only): nothing changes before DoRemoval(), which
-            // makes this side edge's UV trims anew from its curve once its interval
-            // reaches the corner.
-            if self.exact_only {
+            // Not upstream (WR-606, exact only; and a side curve run on as itself): nothing
+            // changes before DoRemoval(), which makes this side edge's UV trims anew from its
+            // curve once its interval reaches the corner.
+            if self.exact_only || self.corner(which_end, which_side)?.new_side_curve.is_some() {
                 self.corner_mut(which_end, which_side)?.rebuild_side_uvs = true;
                 return Ok(());
             }
@@ -855,6 +899,11 @@ impl FilletRemoval {
             // Also expand the domains, for srf/srf/srf intersect.
             uv_domain_end.expand_relative(2.0);
             uv_domain_tan.expand_relative(2.0);
+            // Not upstream: an analytic surface continued exactly over them.
+            let end_surf =
+                continued_copy(k, b, self.end_face(which_end)?, &uv_domain_end, end_surf)?;
+            let tan_surf =
+                continued_copy(k, b, self.tan_face(which_side)?, &uv_domain_tan, tan_surf)?;
 
             let int = or_sm_err(end_surf.point_based_surface_intersect(
                 k,
@@ -920,6 +969,34 @@ impl FilletRemoval {
         // Also expand the domains, for srf/srf/srf intersect.
         uv_domain1.expand_relative(2.0);
         uv_domain2.expand_relative(2.0);
+        // Not upstream: an analytic surface continued exactly over them.
+        let tan0 = continued_copy(k, b, self.tan_face(0)?, &uv_domain1, tan0)?;
+        let tan1 = continued_copy(k, b, self.tan_face(1)?, &uv_domain2, tan1)?;
+
+        // Not upstream: a sharp edge that runs straight between its corners on both faces
+        // (planes, a plane along a cylinder's or cone's ruling, parallel cylinders) is that
+        // line, exactly; its UV trims are made from it when it is installed.
+        let corners = [
+            tan0.evaluate_point(k, surface0_points[0])?,
+            tan0.evaluate_point(k, surface0_points[1])?,
+        ];
+        if k.fixes.fillet_removal_continues_analytic_faces
+            && straight_on_both(
+                k,
+                [
+                    (&tan0, &uv_domain1, surface0_points),
+                    (&tan1, &uv_domain2, surface1_points),
+                ],
+                corners,
+                self.tol_3d,
+            )?
+        {
+            self.new_edge_curve_3d =
+                Some(Curve::from(Line::from_points(corners[0], corners[1], 3)));
+            self.new_edge_curve_uvs = [None, None];
+            self.new_edge_deviation = 0.0;
+            return Ok(());
+        }
 
         let int = or_sm_err(tan0.point_based_surface_intersect(
             k,
@@ -936,6 +1013,20 @@ impl FilletRemoval {
         let Some(int_crv_3d) = int.curve_3d else {
             return Err(sm_err());
         };
+        // Not upstream: a traced curve that does not run from corner to corner is refused, not
+        // installed.
+        let ivl = int_crv_3d.natural_interval();
+        let ends = [
+            int_crv_3d.evaluate_point(k, ivl.min())?,
+            int_crv_3d.evaluate_point(k, ivl.max())?,
+        ];
+        let reaches = |a: Point3, b: Point3| a.distance(b) <= self.tol_3d;
+        if k.fixes.fillet_removal_continues_analytic_faces
+            && !((reaches(ends[0], corners[0]) && reaches(ends[1], corners[1]))
+                || (reaches(ends[0], corners[1]) && reaches(ends[1], corners[0])))
+        {
+            return Err(sm_err());
+        }
 
         self.new_edge_curve_3d = Some(int_crv_3d);
         self.new_edge_curve_uvs = [int.surface1_uv_curve, int.surface2_uv_curve];
@@ -1152,6 +1243,32 @@ impl FilletRemoval {
                 .new_side_curve
                 .take()
             {
+                // Not upstream: an ellipse run on as itself makes its NURB anew, which may
+                // parameterise the old part anew: the far end from the far vertex dropped on it.
+                if matches!(new_curve.kind(), CurveKind::Ellipse(_)) {
+                    let near = ner(self.corner(which_end, which_side)?.vertex)?;
+                    let far = ner(edge::other_vertex(b, side_edge, Some(near))?)?;
+                    let far_point = b.vertex(far)?.point;
+                    let ivl = new_curve.natural_interval();
+                    let d = or_sm_err(new_curve.drop_point(
+                        k,
+                        &ivl,
+                        far_point,
+                        None,
+                        tol,
+                        Some(if high_end { ivl.min() } else { ivl.max() }),
+                        SolverOperation::Minimize,
+                    ))?;
+                    if !d.success || d.distance > tol {
+                        return Err(sm_err());
+                    }
+                    let (lo, hi) = if high_end {
+                        (d.parameter, new_side_edge_param)
+                    } else {
+                        (new_side_edge_param, d.parameter)
+                    };
+                    new_side_edge_domain.set_min_max(lo, hi)?;
+                }
                 with_kernel_callbacks(k, b, |_k, b, env| {
                     let owner = (env.key_of)(EntityRef::Edge(side_edge));
                     let _ = new_curve.set_owner(Some(owner), Some(brep_p2::brep_ref(b)));
@@ -1250,11 +1367,22 @@ impl FilletRemoval {
         if !drop.success || drop.distance > tol {
             return Err(sm_err());
         }
-        let (t0, t1) = if high_end {
-            (drop.parameter, fixed)
+        // Not upstream: the far vertex within the tolerance of the joined curve's own far end
+        // (where it was before the join) keeps that end, so the edge and its UV trims, made
+        // over the whole curve, share one interval (`SmEdgeuse` test #25).
+        let far_end = if high_end {
+            curve_domain.min()
         } else {
-            (fixed, drop.parameter)
+            curve_domain.max()
         };
+        let far = if k.fixes.fillet_removal_continues_analytic_faces
+            && curve.evaluate_point(k, far_end)?.distance(far_point) <= tol
+        {
+            far_end
+        } else {
+            drop.parameter
+        };
+        let (t0, t1) = if high_end { (far, fixed) } else { (fixed, far) };
 
         new_side_edge_domain.set_min_max(t0, t1)?;
         edge::set_interval(b, side_edge, &new_side_edge_domain)?;
@@ -1394,8 +1522,21 @@ impl FilletRemoval {
         // (the last one validating the geometry)
         let [uv0, uv1] = std::mem::take(&mut self.new_edge_curve_uvs);
         let deviation = self.new_edge_deviation;
+        // (not upstream: the port's owner naming) the curve owned under its edge's identity,
+        // as the end edges' new curves are
+        own_edge_curve(b, survive_edge)?;
+        let exact = uv0.is_none() && uv1.is_none();
         set_trim_curve(k, b, survive_edge, self.tan_face(0)?, uv0, deviation, false)?;
         set_trim_curve(k, b, survive_edge, self.tan_face(1)?, uv1, deviation, true)?;
+        // Not upstream: the exact straight edge's UV trims, made from it.
+        if exact {
+            for eu in b.edge(survive_edge)?.edgeuses.clone() {
+                get_or_create_uv_trim_curve(k, b, eu, false, false, true)?.status?;
+                if eu1::uv_trim_curve(b, eu)?.0.is_none() {
+                    return Err(SolidError::null_pointer(OP));
+                }
+            }
+        }
 
         // Not upstream (WR-606, exact only): UV trims of the side edges that run on to the
         // corners, made anew.
@@ -1476,6 +1617,197 @@ fn out_of_bounds_copy(b: &Brep, f: FaceId) -> Result<Surface> {
     Ok(s)
 }
 
+/// Not upstream: whether the segment between `corners` lies on both surfaces (each given
+/// with its domain and its UV points at the corners), to `tol`: seven points along it dropped
+/// on each, from the UV points between its corners'.
+fn straight_on_both(
+    k: &Kernel,
+    surfaces: [(&Surface, &Extent2d, [Point2; 2]); 2],
+    corners: [Point3; 2],
+    tol: f64,
+) -> Result<bool> {
+    for i in 1..8 {
+        let t = f64::from(i) / 8.0;
+        let q = corners[0] + (corners[1] - corners[0]) * t;
+        for (surface, domain, uvs) in surfaces {
+            let guess = uvs[0] + (uvs[1] - uvs[0]) * t;
+            let r = surface.local_point_solve::<crate::surface::surface::p4::NoObject>(
+                k,
+                domain,
+                SolverOperation::Minimize,
+                q,
+                guess,
+            )?;
+            let start = &r.solution.start;
+            if !r.found
+                || surface
+                    .evaluate_point(k, Point2::new(start.param(0)?, start.param(1)?))?
+                    .distance(q)
+                    > tol
+            {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+/// Not upstream: `f`'s surface over at least `domain` (its own, expanded) for the removal's
+/// intersections. A cylinder, cone, sphere or torus is continued exactly as itself
+/// ([`OffsetSurface::continue_as_itself`], the kernel's own recognition): its out-of-bounds
+/// copy, evaluated past the end of its profile, leaves the surface, and the intersections
+/// find no corner there. Any other surface stays `oob`, the out-of-bounds copy, as upstream.
+fn continued_copy(
+    k: &Kernel,
+    b: &Brep,
+    f: FaceId,
+    domain: &Extent2d,
+    oob: Surface,
+) -> Result<Surface> {
+    let base = ner(crate::topology::face::p2::surface(b, f)?)?;
+    if !k.fixes.fillet_removal_continues_analytic_faces || !OffsetSurface::continues_as_itself(base)
+    {
+        return Ok(oob);
+    }
+    let mut s = continued_as_itself(k, base, domain)?;
+    set_out_of_bounds_enabled(&mut s, true);
+    Ok(s)
+}
+
+/// Not upstream: `surface` (a cylinder, cone, sphere or torus) continued as itself over at
+/// least `domain` ([`OffsetSurface::continue_as_itself`]), given back as its own kind: the
+/// continued NURB, the same surface at the same parameters, put into a copy of it and its
+/// analytic data made anew from it. The continuation comes back a plain B-spline, which is
+/// no longer taken for one that continues as itself (a second removal on the face then
+/// intersected an out-of-bounds copy that leaves the surface).
+fn continued_as_itself(k: &Kernel, surface: &Surface, domain: &Extent2d) -> Result<Surface> {
+    // a bound past the surface's own by no more than parameter noise is its own: no span of
+    // that length is added
+    let own = surface.natural_uv_domain_with_nurb(k)?;
+    let snap = |want: f64, have: f64| {
+        if (want - have).abs() <= EFF_ZERO * (1.0 + have.abs()) {
+            have
+        } else {
+            want
+        }
+    };
+    let lo = Point2::new(
+        snap(domain.min().x, own.min().x),
+        snap(domain.min().y, own.min().y),
+    );
+    let hi = Point2::new(
+        snap(domain.max().x, own.max().x),
+        snap(domain.max().y, own.max().y),
+    );
+    let continued = OffsetSurface::continue_as_itself(k, surface, lo, hi)?;
+    let SurfaceKind::BSpline(net) = continued.kind() else {
+        return Ok(continued);
+    };
+    let net = one_linear_span(net)?.unwrap_or_else(|| net.clone());
+    let grown = continued.natural_uv_domain_with_nurb(k)?;
+    let mut same = surface.copy(k)?;
+    match same.kind_mut() {
+        SurfaceKind::Cone(c) => {
+            *c.base_mut() = net;
+            c.rebuild_step_from_nurb_parameters(k)?;
+        }
+        SurfaceKind::Sphere(s) => {
+            *s.base_mut().base_mut() = net;
+            s.base_mut().update_analytical_domain(k, &grown)?;
+        }
+        SurfaceKind::Torus(t) => {
+            *t.base_mut().base_mut() = net;
+            t.base_mut().update_analytical_domain(k, &grown)?;
+        }
+        _ => return Ok(continued),
+    }
+    Ok(same)
+}
+
+/// Not upstream: `s` with its degree-1 direction in one span, its first and last rows,
+/// where every other row lies on the line between them at its knot (homogeneously; as
+/// [`OffsetSurface::continue_as_itself`] carries a cone's line on): the same surface at
+/// the same parameters, in the form a cone's analytic data are read from (two control
+/// points along its line). `None` where it has one span already or its rows are not on
+/// that line.
+fn one_linear_span(s: &BSplineSurface) -> Result<Option<BSplineSurface>> {
+    let along_v = s.degree(SurfParamType::V) == 1;
+    if !along_v && s.degree(SurfParamType::U) != 1 {
+        return Ok(None);
+    }
+    let net = s.control_point_net()?;
+    let (nu, nv) = (net.u_count, net.v_count);
+    let (n_lin, n_other) = if along_v { (nv, nu) } else { (nu, nv) };
+    let (lin_knots, _) = s.knots(
+        if along_v {
+            SurfParamType::V
+        } else {
+            SurfParamType::U
+        },
+        None,
+    )?;
+    if n_lin <= 2 || lin_knots.len() != n_lin {
+        return Ok(None);
+    }
+    let at = |r: usize, j: usize| if along_v { r * nv + j } else { j * nv + r };
+    let w = |i: usize| net.weights.get(i).copied().unwrap_or(1.0);
+    let point = |i: usize| net.points.get(i).copied().ok_or_else(|| null("net"));
+    let (t0, tn) = (lin_knots[0], lin_knots[n_lin - 1]);
+    let mut kept: Vec<(usize, usize)> = Vec::with_capacity(n_other);
+    for r in 0..n_other {
+        let (a, b) = (at(r, 0), at(r, n_lin - 1));
+        let (pa, pb) = (point(a)? * w(a), point(b)? * w(b));
+        for (j, &t) in lin_knots.iter().enumerate().take(n_lin - 1).skip(1) {
+            let f = (t - t0) / (tn - t0);
+            let wj = w(a) + (w(b) - w(a)) * f;
+            let q = point(at(r, j))?;
+            let on = (pa + (pb - pa) * f) * (1.0 / wj);
+            if on.distance(q) > EFF_ZERO * (1.0 + q.max_dimension())
+                || (w(at(r, j)) - wj).abs() > EFF_ZERO * (1.0 + wj)
+            {
+                return Ok(None);
+            }
+        }
+        kept.push((a, b));
+    }
+    let (new_u, new_v) = if along_v { (nu, 2) } else { (2, nv) };
+    let mut points = Vec::with_capacity(new_u * new_v);
+    let mut weights = Vec::with_capacity(new_u * new_v);
+    for i in 0..new_u {
+        for j in 0..new_v {
+            let (r, end) = if along_v { (i, j) } else { (j, i) };
+            let (a, b) = kept.get(r).copied().ok_or_else(|| null("row"))?;
+            let idx = if end == 0 { a } else { b };
+            points.push(point(idx)?);
+            weights.push(w(idx));
+        }
+    }
+    let (ku, mu) = s.knots(SurfParamType::U, None)?;
+    let (kv, mv) = s.knots(SurfParamType::V, None)?;
+    let ends = [t0, tn];
+    let two = [2, 2];
+    let (u_knots, u_mults, v_knots, v_mults): (&[f64], &[usize], &[f64], &[usize]) = if along_v {
+        (&ku, &mu, &ends, &two)
+    } else {
+        (&ends, &two, &kv, &mv)
+    };
+    Ok(Some(BSplineSurface::create_canonical(
+        &crate::nurbs::b_spline_surface::p1::CanonicalSurfaceData {
+            u_degree: s.degree(SurfParamType::U),
+            v_degree: s.degree(SurfParamType::V),
+            control_points: &points,
+            form: crate::nurbs::b_spline_surface::p1::BSplineSurfaceForm::Unspecified,
+            u_multiplicities: u_mults,
+            v_multiplicities: v_mults,
+            u_knots,
+            v_knots,
+            knot_type: crate::nurbs::b_spline_curve::p1::KnotType::Unspecified,
+            weights: Some(&weights),
+            uv_domain: None,
+        },
+    )?))
+}
+
 /// `pVertex->SetPoint(p)` through the kernel's callbacks.
 fn set_vertex_point(k: &mut Kernel, b: &mut Brep, v: VertexId, p: Point3) -> Result<()> {
     with_kernel_callbacks(k, b, |_k, b, env| {
@@ -1500,6 +1832,22 @@ fn set_vertex_point(k: &mut Kernel, b: &mut Brep, v: VertexId, p: Point3) -> Res
 /// (statuses ignored upstream).
 fn grow_face(k: &Kernel, b: &mut Brep, f: FaceId, domain: &Extent2d) -> Result<()> {
     crate::topology::face::p2::set_uv_domain(b, f, domain)?;
+    // Not upstream: a cylinder, cone, sphere or torus grows as itself (as `continued_copy`),
+    // the same surface at the same parameters, and only where the domain passes its own; its
+    // spans expanded would change it (the whole of a revolved face moved).
+    if let Some(surface) = crate::topology::face::p2::surface(b, f)? {
+        if k.fixes.fillet_removal_continues_analytic_faces
+            && OffsetSurface::continues_as_itself(surface)
+        {
+            let own = surface.natural_uv_domain_with_nurb(k)?;
+            if !(own.contains_point(domain.min(), 0.0) && own.contains_point(domain.max(), 0.0)) {
+                let grown = continued_as_itself(k, surface, domain)?;
+                let this = owner_keys(b)(EntityRef::Face(f));
+                crate::topology::face::p1::set_surface(k, b, f, this, grown, true)?;
+            }
+            return Ok(());
+        }
+    }
     let Some(surface) = b.face_mut(f)?.surface.as_mut() else {
         return Ok(());
     };
