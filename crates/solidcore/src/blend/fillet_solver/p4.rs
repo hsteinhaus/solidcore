@@ -463,6 +463,11 @@ impl FilletSolver {
         // short of the edge's end runs on to it first
         c2_trace_to_edge_ends(ops, &mut cx, &mut st)?;
 
+        // not upstream (`fixes.fillet_trace_points_in_their_edges_period`)
+        if cx.k.fixes.fillet_trace_points_in_their_edges_period {
+            c2_points_in_edges_period(ops, &mut cx, &mut st)?;
+        }
+
         // :1872-1920 no points; drop near-duplicate end points
         c2_clean_ends(ops, &mut cx, &mut st)?;
 
@@ -897,6 +902,95 @@ fn c1_collect_points(
     Ok(Some(SurfPass { uv_curve, all }))
 }
 
+/// A base surface's periods (`None` in a direction it is not periodic in) and the ends of
+/// the filleted edge's UV trim curve on it.
+struct EdgePeriod {
+    period: [Option<f64>; 2],
+    ends: [Point2; 2],
+}
+
+/// [`EdgePeriod`] of both base surfaces, from the edge use on each.
+fn edge_periods(
+    ops: &mut dyn FilletSolverOps,
+    cx: &mut Cx<'_>,
+    st: &CalcState,
+) -> Result<[EdgePeriod; 2]> {
+    use crate::nurbs::b_spline_surface::SurfParamType;
+    let mut out: [EdgePeriod; 2] = std::array::from_fn(|_| EdgePeriod {
+        period: [None; 2],
+        ends: [Point2::new(0.0, 0.0); 2],
+    });
+    for (which, slot) in out.iter_mut().enumerate() {
+        let eu = ops
+            .solver()
+            .edgeuse(which)?
+            .ok_or_else(|| SolidError::null_pointer(OP))?;
+        let uv_curve = get_or_create_uv_trim_curve(cx.k, cx.target, eu)?;
+        for (end, t) in slot.ends.iter_mut().zip([st.ivl.min(), st.ivl.max()]) {
+            let p = uv_curve.evaluate_point(cx.k, t)?;
+            *end = Point2::new(p.x, p.y);
+        }
+        let surface = &st.base_surfaces[which];
+        let domain = surface.natural_uv_domain_with_nurb(cx.k)?;
+        for (d, (param, width)) in [
+            (SurfParamType::U, domain.max().x - domain.min().x),
+            (SurfParamType::V, domain.max().y - domain.min().y),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if matches!(surface.is_periodic(cx.k, &domain, param), Ok(true)) {
+                slot.period[d] = Some(width);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Not upstream (`fixes.fillet_trace_points_in_their_edges_period`): every trace point on a
+/// periodic base surface in the period of the filleted edge's UV trim curve there
+/// ([`in_edges_period`]; the same 3D point).
+fn c2_points_in_edges_period(
+    ops: &mut dyn FilletSolverOps,
+    cx: &mut Cx<'_>,
+    st: &mut CalcState,
+) -> Result<()> {
+    use crate::intersect::surface_intersector::p1::SrfIndex;
+    let periods = edge_periods(ops, cx, st)?;
+    for &r in &st.tsect_pnts {
+        let tsect = st.store.get_mut(cx.fillets, r)?;
+        for (srf, p) in [SrfIndex::First, SrfIndex::Second]
+            .into_iter()
+            .zip(&periods)
+        {
+            let uv = tsect.uv_pos_mut(srf);
+            uv.x = in_edges_period(uv.x, p.period[0], [p.ends[0].x, p.ends[1].x]);
+            uv.y = in_edges_period(uv.y, p.period[1], [p.ends[0].y, p.ends[1].y]);
+        }
+    }
+    Ok(())
+}
+
+/// `x` shifted by whole `period`s to the copy nearest either of `ends` (the edge's own
+/// parameters): a point found in another period than its edge's is the same point there,
+/// and the trace, which runs in the edge's period, meets it.
+fn in_edges_period(x: f64, period: Option<f64>, ends: [f64; 2]) -> f64 {
+    let Some(p) = period.filter(|p| *p > 0.0) else {
+        return x;
+    };
+    let mut best = x;
+    let mut best_d = (x - ends[0]).abs().min((x - ends[1]).abs());
+    for e in ends {
+        let shifted = x + ((e - x) / p).round() * p;
+        let d = (shifted - ends[0]).abs().min((shifted - ends[1]).abs());
+        if d < best_d {
+            best = shifted;
+            best_d = d;
+        }
+    }
+    best
+}
+
 #[cfg(test)]
 mod tests_c1 {
     use super::*;
@@ -910,6 +1004,15 @@ mod tests_c1 {
     use crate::intersect::surface_intersector::p1::SrfIndex;
     use crate::nurbs::b_spline_surface_n_lib::p2::OrientType;
     use crate::topology::{Edgeuse, Vertexuse};
+
+    #[test]
+    fn a_trace_point_moves_into_its_edges_period() {
+        let p = 43.98;
+        // the edge runs u 0..11; its seam end found one period up
+        assert!((in_edges_period(43.27, Some(p), [0.0, 11.0]) - (43.27 - p)).abs() < 1e-12);
+        assert_eq!(in_edges_period(11.7, Some(p), [0.0, 11.0]), 11.7);
+        assert_eq!(in_edges_period(43.27, None, [0.0, 11.0]), 43.27);
+    }
 
     /// A solver whose `SetExtensionFlags` is a no-op (the base one needs the
     /// executive).

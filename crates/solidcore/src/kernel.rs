@@ -368,6 +368,12 @@ pub struct UpstreamFixes {
     /// both faces is that line; and a traced sharp edge not running corner to corner is
     /// refused. Upstream finds no corner, or builds a body whose trims miss its edges.
     pub fillet_removal_continues_analytic_faces: bool,
+    /// A fillet's trace start points on a periodic base surface lie in the period of the
+    /// filleted edge's UV trim curve there (shifted by whole periods to the copy nearest its
+    /// ends). Upstream keeps the copy its solve found; for an edge ending on a full
+    /// cylinder's seam that is the other side of the seam, the trace runs past it into the
+    /// extension, misses it, and fails (1001, "Fillet Surface Computation Failure").
+    pub fillet_trace_points_in_their_edges_period: bool,
     /// The fillet executive refuses two rounds on edges of one face whose rails cross on it (no room between them), before the target is edited, where upstream builds an open body (WR-460, #1073). A closest-point query on an edge with no solution finds no crossing there and is not a failure (#2050).
     pub fillet_refuse_crossing_rails: bool,
     /// The vertex overload of `SmFilletErrorInfo::NoteError` records the vertex, its location, the fillet status, the error code and the comment, as the edge overload does, and `CreateFilletCorners` notes a vertex no corner type handles as `SM_FILERR_CORNER_UNSUPPORTED` with "Corner case not implemented" (WR-513, #1469; tangency-labs/smlib@a73cf5e). The pinned overload records nothing, so the failure reached the caller as the generic 1001 with no reason. Off by default (pinned behaviour). Diagnostics only: the pending vertex entry and the operation's result are unchanged, so this does not make an unsupported corner succeed. The whole-operation wrappers (e.g. `fillet_edges`) drop their session and return only the later failure; the retained note is readable through [`crate::blend::fillet_executive::session::FilletSession::error_info`]. The C API's `SMLIB_ERR_CORNER_UNSUPPORTED` (-1111) is not mapped here.

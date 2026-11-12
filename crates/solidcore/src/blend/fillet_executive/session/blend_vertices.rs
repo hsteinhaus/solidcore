@@ -2,7 +2,8 @@
 //! of a fillet's blend faces put where the surfaces of their faces meet.
 //!
 //! A vertex the fillet makes is the end of a fitted rail or section curve, so it lies off a
-//! face it bounds by up to that curve's fit ([`put_vertices_on_their_faces`]).
+//! face it bounds by up to that curve's fit ([`put_vertices_on_their_faces`]), and off a
+//! periodic face's seam it ends on ([`put_vertices_on_seams`]).
 //!
 //! | Rust | Upstream |
 //! |------|----------|
@@ -14,11 +15,14 @@ use crate::error::{EntityRef, Result};
 use crate::geom::attribute::ids;
 use crate::kernel::Kernel;
 use crate::topology::brep::p1;
-use crate::topology::brep::vertices_on_faces::put_vertices_on_their_faces;
+use crate::topology::brep::vertices_on_faces::{
+    put_vertices_on_seams, put_vertices_on_their_faces,
+};
 use crate::topology::{vertex, FaceId, VertexId};
 
 impl FilletSession<'_> {
-    /// [`put_vertices_on_their_faces`] for the vertices of the blend faces (marked
+    /// [`put_vertices_on_their_faces`], then [`put_vertices_on_seams`], for the vertices of
+    /// the blend faces (marked
     /// [`ids::FILLET_BLEND_FACE`]).
     ///
     /// # Errors
@@ -47,7 +51,8 @@ impl FilletSession<'_> {
             }
         }
         FinishAccess(&mut self.objects).with_target_env(k, |k, b, env| {
-            put_vertices_on_their_faces(k, b, env, &vertices)
+            put_vertices_on_their_faces(k, b, env, &vertices)?;
+            put_vertices_on_seams(k, b, env, &vertices)
         })
     }
 }
