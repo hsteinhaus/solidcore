@@ -372,7 +372,9 @@ pub struct UpstreamFixes {
     /// filleted edge's UV trim curve there (shifted by whole periods to the copy nearest its
     /// ends). Upstream keeps the copy its solve found; for an edge ending on a full
     /// cylinder's seam that is the other side of the seam, the trace runs past it into the
-    /// extension, misses it, and fails (1001, "Fillet Surface Computation Failure").
+    /// extension, misses it, and fails (1001, "Fillet Surface Computation Failure"). Likewise
+    /// the two ends of a round's end rib on a periodic end face (the fork's `sm_TangentEndRib`)
+    /// lie in one period: a rib from a seam crossed the whole face and did not solve.
     pub fillet_trace_points_in_their_edges_period: bool,
     /// The fillet executive refuses two rounds on edges of one face whose rails cross on it (no room between them), before the target is edited, where upstream builds an open body (WR-460, #1073). A closest-point query on an edge with no solution finds no crossing there and is not a failure (#2050).
     pub fillet_refuse_crossing_rails: bool,

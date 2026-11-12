@@ -21,6 +21,7 @@ use crate::blend::fillet_solver::p1::{
 };
 use crate::curve::curve::Curve;
 use crate::error::{Result, SolidError};
+use crate::geom::extent2d::Extent2d;
 use crate::geom::global_solver::SolverOperation;
 use crate::geom::vector2d::Point2;
 use crate::kernel::Kernel;
@@ -197,6 +198,53 @@ fn tangent_end_rib_point(
     Ok(None)
 }
 
+/// Not upstream (`fixes.fillet_trace_points_in_their_edges_period`): the rib's two ends `uv` on
+/// a surface periodic in a direction, in one period there, within half a period of each other
+/// (the rib between them does not wrap round the surface). An end on the domain's bound (a seam)
+/// goes to the other bound, which keeps both in the domain; else the second end moves by whole
+/// periods.
+fn same_period(k: &Kernel, surface: &Surface, dom: &Extent2d, uv: &mut [Point2; 2]) {
+    use crate::nurbs::b_spline_surface::SurfParamType;
+    for (param, lo, hi) in [
+        (SurfParamType::U, dom.min().x, dom.max().x),
+        (SurfParamType::V, dom.min().y, dom.max().y),
+    ] {
+        let p = hi - lo;
+        if !(p > 0.0) || !matches!(surface.is_periodic(k, dom, param), Ok(true)) {
+            continue;
+        }
+        let tol = EFF_ZERO_SQRT * smax(1.0, p);
+        let u = param == SurfParamType::U;
+        let [q0, q1] = uv;
+        let (mut x0, mut x1) = if u { (q0.x, q1.x) } else { (q0.y, q1.y) };
+        if (x1 - x0).abs() <= 0.5 * p {
+            continue;
+        }
+        // an end on a bound goes to the other one
+        let other = |x: f64| {
+            if (x - lo).abs() <= tol {
+                Some(hi)
+            } else if (x - hi).abs() <= tol {
+                Some(lo)
+            } else {
+                None
+            }
+        };
+        if let Some(y) = other(x0).filter(|y| (x1 - y).abs() <= 0.5 * p) {
+            x0 = y;
+        } else if let Some(y) = other(x1).filter(|y| (y - x0).abs() <= 0.5 * p) {
+            x1 = y;
+        } else {
+            x1 -= ((x1 - x0) / p).round() * p;
+        }
+        if u {
+            (q0.x, q1.x) = (x0, x1);
+        } else {
+            (q0.y, q1.y) = (x0, x1);
+        }
+    }
+}
+
 /// The curves of [`tangent_end_rib`].
 #[derive(Debug, Clone)]
 pub struct TangentEndRib {
@@ -269,6 +317,14 @@ pub fn tangent_end_rib(
         if let (Some(f), Some(g)) = (fil_uv.get_mut(kk), end_uv.get_mut(kk)) {
             *f = d.result_uv;
             *g = e.result_uv;
+        }
+    }
+    if k.fixes.fillet_trace_points_in_their_edges_period {
+        for (uv, surface, dom) in [
+            (&mut fil_uv, fillet, &fil_dom),
+            (&mut end_uv, end, &end_dom),
+        ] {
+            same_period(k, surface, dom, uv);
         }
     }
     let [fil0, fil1] = fil_uv;
